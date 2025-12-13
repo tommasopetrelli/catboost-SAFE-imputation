@@ -15,7 +15,7 @@ library(haven)
 library(forcats)
 
 # ===============================================================
-# BLOCK A: Q8A imputation
+# BLOCK A: Data cleaning and creation of lag and gap variables to add temporal structure
 # ===============================================================
 
 # A.1 Load & initial filtering ----------------------------------------------
@@ -31,7 +31,7 @@ dataset_A <- read_dta("C:/Users/RDS-petreto/Desktop/Financing Gap/safepanel_allr
   )
 
 
-# A.1b
+# A.2
 
 dataset_A <- dataset_A %>% 
   arrange(permid, wave)
@@ -93,12 +93,12 @@ dataset_A <- dataset_A %>%
 
 write_dta(dataset_A, "Dataset_test_V12.dta")
 
-# A.2 Define target variable Q8A --------------------------------------------
+# A.3 Define target variable Q8A --------------------------------------------
 
 dataset_A <- dataset_A %>%
   mutate(Q8A_target = as.factor(haven::as_factor(q8a)))
 
-# A.3 Build predictors: gaps numeric, everything else factor -----------------
+# A.4 Build predictors: gaps numeric, everything else factor -----------------
 
 predictors_A <- dataset_A %>% 
   select(-q8a, -Q8A_target)
@@ -112,7 +112,7 @@ predictors_A <- predictors_A %>%
     # gap vars stay as they are (numeric)
   )
 
-# A.4 Filters: high missingness, low variance -------
+# A.5 Filters: high missingness, low variance -------
 
 non_missing_threshold <- 0.60               
 non_na_pct <- colMeans(!is.na(predictors_A))
@@ -156,12 +156,18 @@ if (length(to_drop) > 0) {
 
 cat("Variables kept after pairs filtering:", ncol(predictors_A), "\n")
 
-# A.5' Impute predictors with missRanger ------------------------------------
+# ===============================================================
+# BLOCK B: Predictors imputation
+# ===============================================================
+       
+# B.1 Setting the weight based on missingness -------------------
 
 ## Case weights = how informative each respondent is
 cw <- rowSums(!is.na(predictors_A))  # number of answered questions per obs
 cw <- cw / mean(cw)                  # rescaling
 
+# B.2 Impute predictors with missRanger ------------------------
+       
 set.seed(123)
 
 X_A <- missRanger(
@@ -172,10 +178,16 @@ X_A <- missRanger(
   case.weights = cw,       # <- weight each *row* based on the missingness
   returnOOB    = TRUE,
   verbose      = 1
-)
-
+  )
+       
 ## OOB misclassification error per variable
 oob_err <- attr(X_A, "oob")
 head(oob_err)
-sort(oob_err, decreasing = TRUE)[1:50]    # worst-imputed questions
-sort(oob_err, decreasing = FALSE)[1:20]   # best-imputed questions
+sort(oob_err, decreasing = FALSE)[1:20]  
+
+# ===============================================================
+# BLOCK C: Target Variable Prediction (q8a)
+# ===============================================================
+
+
+       
