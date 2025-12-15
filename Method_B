@@ -1,0 +1,326 @@
+if (!requireNamespace("missRanger")) install.packages("missRanger")
+if (!requireNamespace("ranger")) install.packages("ranger")
+if (!requireNamespace("dplyr")) install.packages("dplyr")
+if (!requireNamespace("haven")) install.packages("haven")
+if (!requireNamespace("forcats")) install.packages("forcats")
+
+library(missRanger)
+library(ranger)
+library(dplyr)
+library(haven)
+library(forcats)
+library(catboost)
+
+t0 <- Sys.time() # starts the stopwatch
+# ===============================================================
+# BLOCK A: DATA PREPARATION
+# ===============================================================
+
+# A.1 Load & initial filtering ----------------------------------------------
+dataset_A <- read_dta("C:/Users/RDS-petreto/Desktop/Financing Gap/safepanel_allrounds.dta") %>%
+  filter(
+    d0 %in% c("BE", "DK", "DE", "EE", "IE","GR", "ES", "FR", "HR", "IT",
+              "CY", "LV", "LT", "LU", "MT", "NL", "AT", "PL", "PT", "RO",
+              "SI", "SK", "FI", "SE", "BG", "CZ", "HU")
+  ) %>%
+  select(
+    -c(wgtcommon, wgtentr, wgtoldentr, wgtoldcommon, ida,
+       experiment_1, experiment_2, intdate)
+  ) %>%
+  arrange(permid, wave)
+
+# A.2 Identify lag variables -----------------------------------------------
+static_vars <- c("permid", "wave", "d0", "d1_rec",	"d2",	"d3_rec",	"d4",
+                 "d5_rec",	"d6",	"d6_rec",	"d6b",	"d7",	"d7_rec")
+# DEMOGRAPHIC VAR: ID, time, country, employees, d2 ,  sector, d4, company age,
+# d6, d6_rec,d7, d7_rec
+
+all_vars       <- names(dataset_A)
+candidate_vars <- setdiff(all_vars, static_vars)
+
+change_share <- sapply(candidate_vars, function(v) {
+  x    <- dataset_A[[v]]
+  by_id <- split(x, dataset_A$permid)
+  mean(sapply(by_id, function(z) dplyr::n_distinct(na.omit(z)) > 1))
+})
+
+lag_vars <- names(change_share[change_share > 0.05])
+
+# A.3 Create lag and gap variables -----------------------------------------
+last_non_na_index <- function(x) {
+  idx <- seq_along(x)
+  
+  # last non-NA index up to and INCLUDING current row
+  last_incl <- cummax(replace(idx, is.na(x), 0L))
+  
+  # index of strictly PREVIOUS non-NA = lag of that
+  prev_idx <- dplyr::lag(last_incl)
+  
+  # convert 0 (no previous non-NA seen yet) to NA
+  prev_idx[prev_idx == 0L] <- NA_integer_
+  
+  prev_idx
+}
+
+dataset_A <- dataset_A %>%
+  group_by(permid) %>%
+  arrange(wave, .by_group = TRUE) %>%
+  mutate(
+    # LAG: strictly previous non-NA value
+    across(
+      all_of(lag_vars),
+      ~ {
+        prev_idx <- last_non_na_index(.)
+        .[prev_idx]
+      },
+      .names = "{.col}_lag"
+    ),
+    
+    # GAP: numeric distance since previous non-NA
+    across(
+      all_of(lag_vars),
+      ~ {
+        prev_idx <- last_non_na_index(.)
+        idx <- seq_along(.)
+        as.numeric(ifelse(is.na(prev_idx), NA, idx - prev_idx))
+      },
+      .names = "{.col}_gap"
+    )
+  ) %>%
+  ungroup()
+
+# A.4 Restrict waves  -----------------------------------
+dataset_A <- dataset_A %>%
+  filter(wave > 10, !wave %in% c(31, 33, 35))
+
+
+# A.5 Type assignments & build predictors ----------------------------------
+dataset_A <- dataset_A %>%
+  mutate(
+    permid      = as.numeric(permid),                    # ID numeric
+    wave        = as.numeric(wave),                      # wave numeric
+    d0          = as.factor(d0),                         # country factor
+    Q8A_target  = ordered(haven::as_factor(q8a))         # ordered target
+  )
+
+predictors_A <- dataset_A %>% 
+  select(-q8a, -Q8A_target)
+
+gap_cols     <- grep("_gap$", names(predictors_A), value = TRUE)
+id_time_vars <- c("permid", "wave")
+
+predictors_A <- predictors_A %>%
+  mutate(
+    across(
+      .cols = -c(all_of(gap_cols), all_of(id_time_vars), d0),
+      .fns  = ~ as.factor(as.character(.))               # all other covariates as factors
+    )
+    # gaps remain numeric, permid & wave numeric, d0 factor (already set in dataset_A)
+  )
+
+# A.6 Filters: high missingness, low variance, lag-gap pairing --------------
+non_missing_threshold <- 0.60               
+non_na_pct <- colMeans(!is.na(predictors_A))
+
+predictors_A <- predictors_A[, non_na_pct >= non_missing_threshold, drop = FALSE]
+cat("Variables kept after filtering for missingness:", ncol(predictors_A), "\n")
+
+low_var_threshold <- 0.97   # max proportion allowed for the most common category
+
+is_low_var <- sapply(predictors_A, function(x) {
+  if (!is.factor(x)) return(FALSE)   # numeric vars (gaps, ID, wave) are never dropped here
+  x_non_na <- x[!is.na(x)]
+  if (!length(x_non_na)) return(TRUE)
+  tab <- table(x_non_na)
+  (max(tab) / sum(tab)) > low_var_threshold
+})
+
+predictors_A <- predictors_A[, !is_low_var, drop = FALSE]
+cat("Variables kept after low variance filtering:", ncol(predictors_A), "\n")
+
+# 1. Identify all *_lag and *_gap variables
+lag_vars_in_data <- grep("_lag$", names(predictors_A), value = TRUE)
+gap_vars_in_data <- grep("_gap$", names(predictors_A), value = TRUE)
+
+# 2. Extract the "base name" for each
+lag_bases <- sub("_lag$", "", lag_vars_in_data)
+gap_bases <- sub("_gap$", "", gap_vars_in_data)
+
+# 3. Find all bases that have BOTH lag and gap variables
+bases_with_lag_and_gap <- intersect(lag_bases, gap_bases)
+
+# 4. Now check whether the ORIGINAL variable exists too
+original_vars <- bases_with_lag_and_gap[bases_with_lag_and_gap %in% names(predictors_A)]
+
+# 5. Bases with complete triplets
+complete_bases <- original_vars
+
+# 6. Build a list of all variables to KEEP
+vars_to_keep <- c(
+  unlist(lapply(complete_bases, function(b) c(b, paste0(b, "_lag"), paste0(b, "_gap")))),
+  c("permid", "wave", "d0")  # keep ID/time/country no matter what
+)
+
+vars_to_keep <- intersect(vars_to_keep, names(predictors_A))  # ensure existence
+
+# 7. Drop everything else
+predictors_A <- predictors_A[, vars_to_keep, drop = FALSE]
+
+cat("Variables kept after full triplet filtering:", ncol(predictors_A), "\n")
+
+
+write_dta(dataset_A, "Dataset_testA_V13.dta")
+
+# ===============================================================
+# BLOCK B: IMPUTATION (missRanger)
+# ===============================================================
+
+# B.1 Case weights ----------------------------------------------------------
+cw <- rowSums(!is.na(predictors_A))  # number of answered questions per obs
+cw <- cw / mean(cw)                  # rescaling
+
+# B.2 Run missRanger --------------------------------------------------------
+set.seed(123)
+
+predictors_A <- missRanger(
+  predictors_A,
+  num.trees    = 500,
+  num.threads  = parallel::detectCores(),
+  pmm.k        = 3,
+  case.weights = cw,
+  returnOOB    = TRUE,
+  verbose      = 1
+)
+
+# B.3 OOB misclassification error per variable ------------------------------
+oob_err <- attr(predictors_A, "oob")
+head(oob_err)
+sort(oob_err, decreasing = TRUE)[1:150]
+
+# B.4 Attach imputed predictors back to main dataset -----------------------
+final_vars <- c("q8a", "Q8A_target", names(predictors_A))
+
+dataset_A_imputed <- dataset_A %>%
+  select(all_of(final_vars))
+
+dataset_A_imputed[names(predictors_A)] <- predictors_A
+
+write_dta(dataset_A_imputed, "C:/Users/Public/Financing Gap 3/Dataset_pre_Var_Sel_V13.dta")
+
+
+t1 <- Sys.time()  # stops the stopwatch
+t1 - t0
+
+# ===============================================================
+# BLOCK C: PREDICTION (Catboost)
+# ===============================================================
+t2 <- Sys.time()
+
+# ------------------------------------------------------------
+# C.1 Identify rows with and without Q8A_target
+# ------------------------------------------------------------
+has_target <- !is.na(dataset_A_imputed$Q8A_target)
+
+if (!any(!has_target)) {
+  message("No missing values in Q8A_target. Nothing to impute.")
+} else {
+  
+  # ----------------------------------------------------------
+  # C.2 Define predictors (X) and target (y)
+  #     - Use all variables EXCEPT Q8A_target and q8a as predictors
+  # ----------------------------------------------------------
+  predictor_names <- setdiff(names(dataset_A_imputed),
+                             c("Q8A_target", "q8a"))
+  
+  X_train <- dataset_A_imputed[has_target,  predictor_names, drop = FALSE]
+  X_pred  <- dataset_A_imputed[!has_target, predictor_names, drop = FALSE]
+  
+  # Convert character columns to factors (CatBoost needs factors)
+  char_cols_train <- sapply(X_train, is.character)
+  X_train[char_cols_train] <- lapply(X_train[char_cols_train], factor)
+  
+  char_cols_pred <- sapply(X_pred, is.character)
+  X_pred[char_cols_pred] <- lapply(X_pred[char_cols_pred], factor)
+  
+  # Target: keep levels, but give CatBoost integer labels 0..K-1
+  y_factor      <- dataset_A_imputed$Q8A_target[has_target]
+  target_levels <- levels(y_factor)
+  y_train       <- as.integer(y_factor) - 1L   # 0-based integers
+  
+  # ----------------------------------------------------------
+  # C.3 Create train/validation split indices
+  # ----------------------------------------------------------
+  set.seed(123)
+  n <- nrow(X_train)
+  idx_train <- sample(seq_len(n), size = floor(0.8 * n))
+  idx_valid <- setdiff(seq_len(n), idx_train)
+  
+  # ----------------------------------------------------------
+  # C.4 Build CatBoost pools (no cat_features needed)
+  # ----------------------------------------------------------
+  train_pool <- catboost.load_pool(
+    data  = X_train[idx_train, ],
+    label = y_train[idx_train]
+  )
+  
+  valid_pool <- catboost.load_pool(
+    data  = X_train[idx_valid, ],
+    label = y_train[idx_valid]
+  )
+  
+  # ----------------------------------------------------------
+  # C.5 Set CatBoost parameters and train model
+  # ----------------------------------------------------------
+  params <- list(
+    loss_function  = "MultiClass",
+    eval_metric    = "MultiClass",
+    iterations     = 800,
+    learning_rate  = 0.05,
+    depth          = 6,
+    random_seed    = 123,
+    logging_level  = "Verbose",
+    od_type        = "Iter",
+    od_wait        = 50,
+    thread_count   = parallel::detectCores()
+  )
+  
+  model <- catboost.train(
+    learn_pool = train_pool,
+    test_pool  = valid_pool,
+    params     = params
+  )
+  
+  # ----------------------------------------------------------
+  # C.6 Predict probabilities for missing Q8A_target rows
+  # ----------------------------------------------------------
+  pred_pool <- catboost.load_pool(data = X_pred)
+  
+  pred_prob <- catboost.predict(
+    model,
+    pred_pool,
+    prediction_type = "Probability"
+  )
+  
+  # ----------------------------------------------------------
+  # C.7 Convert predicted probabilities to ordered factor levels
+  # ----------------------------------------------------------
+  class_index <- max.col(pred_prob)         # 1..K
+  
+  Q8A_pred <- factor(
+    target_levels[class_index],
+    levels  = target_levels,
+    ordered = TRUE
+  )
+  
+  # ----------------------------------------------------------
+  # C.8 Write imputations back to dataset_A_imputed
+  # ----------------------------------------------------------
+  dataset_A_imputed$Q8A_target_catboost <- dataset_A_imputed$Q8A_target
+  dataset_A_imputed$Q8A_target_catboost[!has_target] <- Q8A_pred
+}
+
+t3 <- Sys.time()
+t3-t2
+
+
+write_dta(dataset_A_imputed, "C:/Users/Public/Financing Gap 3/Dataset_Fully_Imputed_V13.dta")
