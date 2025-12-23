@@ -1,0 +1,332 @@
+library(tidyverse)
+library(haven)
+library(catboost)
+library(caret)
+library(parallel)
+
+set.seed(123)
+
+# ===============================================================
+# BLOCK A: Data cleaning
+# ===============================================================
+
+dataset_A <- read_dta("C:/Financing Gap/ecb.SAFE_microdata/safepanel_allrounds.dta") %>%
+  filter(
+    d0 %in% c("BE","DK","DE","EE","IE","GR","ES","FR","HR","IT",
+              "CY","LV","LT","LU","MT","NL","AT","PL","PT","RO",
+              "SI","SK","FI","SE","BG","CZ","HU"),
+    wave > 10,
+    !wave %in% c(31, 33, 35)
+  ) %>%
+  select(
+    -c(wgtcommon, wgtentr, wgtoldentr, wgtoldcommon,
+       ida, experiment_1, experiment_2, intdate)
+  ) %>%
+  arrange(permid, wave) %>%
+  mutate(
+    across(
+      -c(permid, wave),
+      ~ if (inherits(.x, "haven_labelled")) haven::as_factor(.x) else as.factor(.x)
+    )
+  )
+
+cat("Step 1 completed | Rows:", nrow(dataset_A),
+    "| Columns:", ncol(dataset_A), "\n")
+
+
+# ---------------------------------------------------------------
+# A.2 Missingness target dependence test (Option C)
+# ---------------------------------------------------------------
+
+missingness_informative <- function(data, var, target, p_thresh = 0.20) {
+  
+  # Use only rows where target is observed (avoid NA target affecting the test)
+  keep_rows <- !is.na(data[[target]])
+  d <- data[keep_rows, , drop = FALSE]
+  
+  miss_flag <- is.na(d[[var]])
+  
+  # no missing → always keep
+  if (all(!miss_flag)) return(TRUE)
+  
+  tab <- table(miss_flag, d[[target]])
+  
+  # degenerate table → keep
+  if (min(dim(tab)) < 2) return(TRUE)
+  
+  pval <- suppressWarnings(chisq.test(tab)$p.value)
+  
+  !is.na(pval) && pval < p_thresh
+}
+
+
+# ---------------------------------------------------------------
+# A.3 Apply the hybrid rule
+#   1) Drop variables with >90% missing
+#   2) Keep variables whose missingness predicts q8a (Option C)
+#   3) Encode remaining NA explicitly as "MISSING" for factor predictors
+#      (Fix 1: EXCLUDE q8a from explicit NA encoding)
+# ---------------------------------------------------------------
+
+id_vars     <- c("permid", "wave", "d0")
+target_var  <- "q8a"
+
+# 1) Drop almost-empty variables
+hard_drop <- names(which(colMeans(is.na(dataset_A)) > 0.90))
+dataset_A  <- dataset_A %>% select(-all_of(hard_drop))
+
+# 2) Option C selection
+candidate_vars <- setdiff(names(dataset_A), c(id_vars, target_var))
+
+vars_to_keep <- candidate_vars[
+  sapply(candidate_vars, function(v)
+    missingness_informative(dataset_A, v, target_var))
+]
+
+dataset_A <- dataset_A %>%
+  select(all_of(c(id_vars, target_var, vars_to_keep)))
+
+# 3) Explicit NA encoding for predictors ONLY (CatBoost-friendly for categorical predictors)
+pred_cols <- setdiff(names(dataset_A), c(id_vars, target_var))
+dataset_A <- dataset_A %>%
+  mutate(across(all_of(pred_cols),
+                ~ if (is.factor(.x)) forcats::fct_explicit_na(.x, "MISSING") else .x))
+
+cat("Step 2 completed | Columns after missingness control:",
+    ncol(dataset_A), "\n")
+
+
+# ---------------------------------------------------------------
+# A.4 Model table preparation (treat q8a as ORDINAL NUMERIC)
+# ---------------------------------------------------------------
+
+model_df <- dataset_A %>% filter(!is.na(q8a))
+
+# Ensure factor and build an ordered mapping robustly
+q8a_factor <- as.factor(model_df$q8a)
+
+lev        <- levels(q8a_factor)
+lev_num    <- suppressWarnings(as.numeric(stringr::str_extract(lev, "\\d+")))
+
+# If levels contain a numeric code (e.g. "1","2","3"... or "1 - ..."),
+# order them by that code; otherwise keep existing level order.
+if (all(!is.na(lev_num))) {
+  ord_levels <- lev[order(lev_num)]
+} else {
+  ord_levels <- lev
+}
+
+q8a_ord <- factor(q8a_factor, levels = ord_levels, ordered = TRUE)
+
+# Ordinal numeric target: 1..K
+y_levels  <- levels(q8a_ord)
+n_classes <- length(y_levels)
+y_ord     <- as.integer(q8a_ord)
+
+# Predictors (exclude firm id to avoid leakage / memorization)
+X_all <- model_df %>% select(-q8a, -permid)
+
+cat_features <- which(
+  sapply(X_all, function(x) is.factor(x) || is.character(x))
+) - 1L
+
+# Regression objective for ordinal numeric
+loss_fun <- "RMSE"
+
+
+# ===============================================================
+# BLOCK B: Model Training
+# ===============================================================
+
+n <- nrow(X_all)
+train_idx <- sample(seq_len(n), floor(0.7 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+
+y_train <- y_ord[train_idx]
+y_test  <- y_ord[test_idx]
+
+train_pool <- catboost.load_pool(
+  X_all[train_idx, ], y_train,
+  cat_features = cat_features
+)
+
+test_pool <- catboost.load_pool(
+  X_all[test_idx, ], y_test,
+  cat_features = cat_features
+)
+
+
+# ===============================================================
+# BLOCK C: Grid Search
+#   (CV chooses best iteration by MIN RMSE)
+#   (Fix 2: robustly detect RMSE column name from catboost.cv output)
+# ===============================================================
+
+grid <- expand.grid(
+  depth         = c(5, 6, 8),
+  learning_rate = c(0.01, 0.03),
+  l2_leaf_reg   = c(3, 5, 7)
+)
+
+cv_folds <- 5
+results  <- vector("list", nrow(grid))
+
+for (i in seq_len(nrow(grid))) {
+  
+  params <- list(
+    loss_function      = loss_fun,
+    eval_metric        = "RMSE",
+    iterations         = 1000,
+    learning_rate      = grid$learning_rate[i],
+    depth              = grid$depth[i],
+    l2_leaf_reg        = grid$l2_leaf_reg[i],
+    od_type            = "Iter",
+    od_wait            = 100,
+    random_seed        = 123,
+    thread_count       = detectCores(),
+    logging_level      = "Silent"
+  )
+  
+  cv <- catboost.cv(
+    pool       = train_pool,
+    params     = params,
+    fold_count = cv_folds,
+    type       = "Classical"
+  )
+  
+  rmse_col <- grep("test.*RMSE.*mean", names(cv), value = TRUE)[1]
+  if (is.na(rmse_col)) {
+    stop("Could not find a test RMSE mean column in catboost.cv output. Columns are: ",
+         paste(names(cv), collapse = ", "))
+  }
+  
+  # Pick iteration with MIN RMSE
+  best_iter <- which.min(cv[[rmse_col]])
+  
+  results[[i]] <- list(
+    params    = grid[i, ],
+    best_iter = best_iter,
+    rmse      = min(cv[[rmse_col]])
+  )
+  
+  cat(sprintf("Grid %02d/%02d | RMSE %.4f | Iter %d\n",
+              i, nrow(grid),
+              results[[i]]$rmse,
+              best_iter))
+}
+
+
+
+# ===============================================================
+# BLOCK D: Final Model
+# ===============================================================
+
+best_id <- which.min(sapply(results, `[[`, "rmse"))
+best    <- results[[best_id]]
+
+final_params <- list(
+  loss_function = loss_fun,
+  eval_metric   = "RMSE",
+  iterations    = best$best_iter,
+  learning_rate = best$params$learning_rate,
+  depth         = best$params$depth,
+  l2_leaf_reg   = best$params$l2_leaf_reg,
+  random_seed   = 123,
+  thread_count  = detectCores()
+)
+
+final_model <- catboost.train(train_pool, params = final_params)
+
+
+# ===============================================================
+# BLOCK E: Test Metrics (Ordinal-upgraded)
+#   - Regression metrics: RMSE, MAE, Spearman
+#   - Ordinal classification (via rounding): exact acc, within-1 acc
+#   - Confusion matrix + Macro-F1 on rounded classes
+#   - Quadratic weighted kappa (ordinal agreement)
+#   (Fix 4: Macro-F1 safe for binary case)
+# ===============================================================
+
+# Continuous ordinal prediction
+pred_cont <- catboost.predict(final_model, test_pool, prediction_type = "RawFormulaVal")
+
+# Round to nearest class index and clamp to valid range 1..K
+pred_round <- as.integer(round(pred_cont))
+pred_round <- pmin(pmax(pred_round, 1L), n_classes)
+
+# Regression-style metrics on ordinal scale
+rmse_test <- sqrt(mean((pred_cont - y_test)^2))
+mae_test  <- mean(abs(pred_cont - y_test))
+spearman  <- suppressWarnings(cor(pred_cont, y_test, method = "spearman"))
+
+# Ordinal accuracy metrics (rounded)
+acc_exact   <- mean(pred_round == y_test)
+acc_within1 <- mean(abs(pred_round - y_test) <= 1L)
+
+# Confusion matrix on rounded classes
+pred_factor <- factor(pred_round, levels = 1:n_classes, labels = y_levels, ordered = TRUE)
+obs_factor  <- factor(y_test,     levels = 1:n_classes, labels = y_levels, ordered = TRUE)
+
+cm <- confusionMatrix(pred_factor, obs_factor)
+
+# Quadratic Weighted Kappa (QWK)
+quadratic_weighted_kappa <- function(truth_int, pred_int, k) {
+  # truth_int and pred_int are integers in 1..k
+  O <- table(factor(truth_int, levels = 1:k),
+             factor(pred_int,  levels = 1:k))
+  O <- as.matrix(O)
+  N <- sum(O)
+  
+  if (N == 0) return(NA_real_)
+  
+  row_m <- rowSums(O)
+  col_m <- colSums(O)
+  E <- outer(row_m, col_m) / N
+  
+  W <- outer(1:k, 1:k, function(i, j) ((i - j)^2) / ((k - 1)^2))
+  
+  1 - (sum(W * O) / sum(W * E))
+}
+
+qwk <- quadratic_weighted_kappa(y_test, pred_round, n_classes)
+
+cat("\n================ FINAL TEST METRICS (ORDINAL) ================\n")
+cat(sprintf("RMSE (cont)            : %.4f\n", rmse_test))
+cat(sprintf("MAE  (cont)            : %.4f\n", mae_test))
+cat(sprintf("Spearman rho           : %.4f\n", spearman))
+cat(sprintf("Exact accuracy (round) : %.4f\n", acc_exact))
+cat(sprintf("Within-1 accuracy       : %.4f\n", acc_within1))
+cat(sprintf("Quadratic weighted kappa: %.4f\n\n", qwk))
+
+cat("---- Confusion matrix (rounded) ----\n")
+print(cm$table)
+
+# Macro-F1 on rounded classes (safe for binary and multiclass)
+macro_f1 <- if (is.matrix(cm$byClass)) {
+  mean(cm$byClass[, "F1"], na.rm = TRUE)
+} else {
+  unname(cm$byClass["F1"])
+}
+cat(sprintf("\nMacro F1 (rounded classes): %.4f\n", macro_f1))
+
+
+# ===============================================================
+# BLOCK F: Final Output Dataset
+# ===============================================================
+
+final_output <- model_df[test_idx, ] %>%
+  mutate(
+    q8a_ord_true       = y_test,
+    q8a_ord_pred_cont  = as.numeric(pred_cont),
+    q8a_ord_pred_round = pred_round,
+    pred_class         = pred_factor,
+    abs_err_round      = abs(pred_round - y_test),
+    correct_round      = pred_round == y_test,
+    within1_round      = abs(pred_round - y_test) <= 1L
+  )
+
+# Fix 5: ensure output directory exists
+out_path <- "C:/Financing Gap/ecb.SAFE_microdata/Method_B_V2.dtas"
+dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(final_output, out_path)
