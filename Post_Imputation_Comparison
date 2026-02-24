@@ -1,0 +1,504 @@
+
+library(dplyr)
+library(haven)
+library(purrr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(viridis)
+
+# ============================================================================
+# BLOCK A: Data preparation and loan-gap components
+# ============================================================================
+
+# A.0 Keep only the necessary variables
+vars_needed <- c(
+  "wave_agg", "d0", "d1_rec", "d3_rec",
+  "wgtcommon",
+  "q7a_a", "q7b_a", "q32", "vulnerable",
+  "q8a_midpoints", "q8a_imp_flag"
+)
+
+# A.1 Read + basic cleaning
+path_in <- "C:/Università/Tesi 3/Dataset_Method_B_V5_aggregated.dta"
+setwd("C:/Università/Tesi 3/Figures")
+
+df <- read_dta(path_in) %>%
+  select(any_of(vars_needed)) %>%
+  # coerce key vars to numeric (safe for labelled haven vars)
+  mutate(across(c(q7a_a, q7b_a, q32, q8a_midpoints, wave_agg, vulnerable), ~ as.numeric(.))) %>%
+  # keep EU sample countries, waves >= 11, and non-vulnerable firms
+  filter(
+    d0 %in% c("BE","DK","DE","EE","IE","GR","ES","FR","HR","IT",
+              "CY","LV","LT","LU","MT","NL","AT","PL","PT","RO",
+              "SI","SK","FI","SE","BG","CZ","HU"),
+    !is.na(wave_agg) & wave_agg >= 11,
+    is.na(vulnerable) | vulnerable == 0
+  )
+
+# --- A.2 Build euro-valued demand and need factors (fixed syntax) ---
+df <- df %>%
+  mutate(
+    loan_demanded = q8a_midpoints,
+    
+    # q32_clean only meaningful for non-applicants:
+    q32_clean = case_when(
+      q7a_a == 1               ~ NA_real_,
+      !is.na(q7b_a)            ~ NA_real_,
+      TRUE                     ~ q32
+    ),
+    
+    # outcome-based need factor A (same mapping you had)
+    loan_need_factor_a = case_when(
+      q7a_a == 3 | q7b_a == 1         ~ 0,
+      q7b_a == 5                      ~ 0.2,
+      q7b_a == 6                      ~ 0.8,
+      q7b_a %in% c(3, 4)              ~ 1,
+      TRUE                            ~ NA_real_
+    ),
+    
+    # extended need factor B: prefer explicit case_when to avoid NA propagation
+    loan_need_factor_b = case_when(
+      q7a_a == 2                                         ~ 1,
+      !is.na(q32_clean) & q32_clean >= 1 & q32_clean <= 6 ~ 1,
+      TRUE                                               ~ loan_need_factor_a
+    )
+  )
+# --- A.3 Euro financing need from factors (0 preserved; NA when undefined) ---
+df <- df %>%
+  mutate(
+    loan_financing_need_a = case_when(
+      loan_need_factor_a == 0 ~ 0,
+      loan_need_factor_a > 0  ~ loan_need_factor_a * loan_demanded,
+      TRUE                    ~ NA_real_
+    ),
+    loan_financing_need_b = case_when(
+      loan_need_factor_b == 0 ~ 0,
+      loan_need_factor_b > 0  ~ loan_need_factor_b * loan_demanded,
+      TRUE                    ~ NA_real_
+    )
+  )
+
+# ============================================================================
+# BLOCK B: Four method samples + gap-by-wave_agg
+# ============================================================================
+
+# B.1 Method samples
+samples <- list(
+  method_1 = df %>% filter(!is.na(loan_need_factor_a)),                    # observed, gap >= 0
+  method_2 = df %>% filter(!is.na(loan_need_factor_b)),                    # observed + shadow, gap >= 0
+  method_3 = df %>% filter(q7a_a == 1, loan_need_factor_a > 0),            # applicants, gap > 0 (A)
+  method_4 = df %>% filter(loan_need_factor_b > 0)                         # extended gap > 0 (B)
+)
+
+# B.2 Map method -> gap variable
+method_gap_var <- c(
+  method_1 = "loan_financing_need_a",
+  method_2 = "loan_financing_need_b",
+  method_3 = "loan_financing_need_a",
+  method_4 = "loan_financing_need_b"
+)
+
+# B.3 Weighted mean helper and aggregator
+weighted_mean <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w)
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+compute_gap <- function(data, gap_var, group_vars = c("wave_agg")) {
+  data %>%
+    filter(!is.na(.data[[gap_var]]), !is.na(wgtcommon)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      gap_eur = weighted_mean(.data[[gap_var]], wgtcommon),
+      n = n(),
+      .groups = "drop"
+    )
+}
+
+# B.4 Compute time series of gap for each method
+gap_by_wave_agg <- purrr::imap(samples, ~{
+  m <- .y
+  compute_gap(.x, gap_var = method_gap_var[[m]], group_vars = c("wave_agg")) %>%
+    mutate(method = m)
+}) %>% bind_rows()
+
+
+# B.5 Compute weighted share of imputed observations per method & wave
+compute_imputation_share <- function(data, group_vars = c("wave_agg")) {
+  data %>%
+    filter(!is.na(q8a_imp_flag), !is.na(wgtcommon)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      share_imputed = weighted_mean(q8a_imp_flag, wgtcommon),
+      .groups = "drop"
+    )
+}
+
+imputation_by_wave <- purrr::imap(samples, ~{
+  m <- .y
+  compute_imputation_share(.x, group_vars = c("wave_agg")) %>%
+    mutate(method = m)
+}) %>% bind_rows()
+
+
+# ============================================================================
+# BLOCK C: Build semiannual calendar index for plotting
+# ============================================================================
+
+# This block creates: year_half, sem_key, sem_index (dense sequential index for plotting),
+# anchored so that wave_agg 11 = 2014H1 for values <= 29; for wave_agg >= 30 we map quarters
+# to H1/H2 as you indicated in earlier code.
+
+gap_time <- gap_by_wave_agg %>%
+  mutate(wave_agg = as.integer(round(wave_agg))) %>%
+  mutate(
+    # semiannual regime (11..29): wave_agg 11 = 2014H1
+    semi_idx  = wave_agg - 11L,
+    semi_year = 2014L + (semi_idx %/% 2L),
+    semi_half = if_else(semi_idx %% 2L == 0L, "H1", "H2"),
+    
+    # quarterly regime (30+): wave_agg is ALREADY a semiannual index
+    # 30 = 2024H1, 31 = 2024H2, 32 = 2025H1, 33 = 2025H2, ...
+    q_idx  = wave_agg - 30L,
+    q_year = 2024L + (q_idx %/% 2L),      # every 2 steps = 1 year
+    q_half = if_else(q_idx %% 2L == 0L, "H1", "H2")
+  ) %>%
+  mutate(
+    year      = if_else(wave_agg <= 29L, semi_year, q_year),
+    half      = if_else(wave_agg <= 29L, semi_half, q_half),
+    year_half = paste0(year, half),
+    sem_key   = year * 2L + if_else(half == "H2", 1L, 0L)
+  ) %>%
+  group_by(method) %>%
+  arrange(sem_key, .by_group = TRUE) %>%
+  mutate(sem_index = dplyr::dense_rank(sem_key)) %>%
+  ungroup()
+
+# Merge imputation share with semester index
+imp_time <- imputation_by_wave %>%
+  mutate(wave_agg = as.integer(round(wave_agg))) %>%
+  left_join(
+    gap_time %>%
+      distinct(wave_agg, year, half, year_half, sem_key, sem_index),
+    by = "wave_agg"
+  )
+
+
+# axis lookup for consistent axis breaks/labels
+sem_axis <- gap_time %>%
+  distinct(sem_index, year_half, sem_key) %>%
+  arrange(sem_index)
+
+# ============================================================================
+# BLOCK D: Combined figure (Gap + Number of Firms)
+# ============================================================================
+
+cb_palette <- c(
+  method_1 = "#E69F00",
+  method_2 = "#56B4E9",
+  method_3 = "#009E73",
+  method_4 = "#D55E00"
+)
+
+cb_labels <- c(
+  method_1 = "Method 1",
+  method_2 = "Method 2",
+  method_3 = "Method 3",
+  method_4 = "Method 4"
+)
+
+gap_time <- gap_time %>%
+  mutate(method = factor(method, levels = c("method_1","method_2","method_3","method_4")))
+
+step <- 2L
+sem_breaks_every2 <- sem_axis$sem_index[seq(1, nrow(sem_axis), by = step)]
+sem_labels_every2 <- sem_axis$year_half[seq(1, nrow(sem_axis), by = step)]
+
+
+# D.1 First Panel (Gap Measure)
+p_gap <- ggplot(gap_time, aes(x = sem_index, y = gap_eur, colour = method)) +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.6) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
+  scale_x_continuous(breaks = sem_breaks_every2, labels = sem_labels_every2) +
+  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 8),
+                     expand = expansion(mult = c(0.02, 0.05))) +
+  scale_colour_manual(values = cb_palette, labels = cb_labels) +
+  labs(x = NULL, y = "Financing gap (EUR)", colour = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linewidth = 0.3),
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    axis.title.y       = element_text(margin = margin(r = 8)),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    plot.background    = element_rect(fill = "white", colour = NA)
+  )
+
+
+# D.2 Second Panel (Samples Dimentions)
+p_nfirms <- ggplot(gap_time, aes(x = sem_index, y = n, colour = method)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
+  scale_x_continuous(breaks = sem_breaks_every2, labels = sem_labels_every2) +
+  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 6),
+                     expand = expansion(mult = c(0.02, 0.05))) +
+  scale_colour_manual(values = cb_palette, labels = cb_labels) +
+  labs(x = NULL, y = "Number of firms", colour = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linewidth = 0.3),
+    legend.position    = "none",
+    axis.title.y       = element_text(margin = margin(r = 8)),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    plot.background    = element_rect(fill = "white", colour = NA)
+  )
+
+
+# D.3 Third panel (Share of imputed observations)
+p_imputed <- ggplot(imp_time, aes(x = sem_index, y = share_imputed, colour = method)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
+  scale_x_continuous(breaks = sem_breaks_every2, labels = sem_labels_every2) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = pretty_breaks(n = 6),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_colour_manual(values = cb_palette, labels = cb_labels) +
+  labs(x = NULL, y = "% Imputed", colour = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linewidth = 0.3),
+    legend.position    = "none",
+    axis.title.y       = element_text(margin = margin(r = 8)),
+    axis.text.x        = element_text(angle = 45, hjust = 1),
+    plot.background    = element_rect(fill = "white", colour = NA)
+  )
+
+
+combined_plot <- p_gap / p_nfirms / p_imputed +
+  plot_layout(heights = c(2, 1, 1))
+
+ggsave(
+  filename = "Weighted Mean Firm-Level Financing Gap.pdf",
+  plot     = combined_plot,
+  width    = 12,   
+  height   = 14,  
+  units    = "in"
+)
+
+print(combined_plot)
+
+
+# ============================================================================
+# BLOCK E (METHOD 4 – DISCRETE ANNUAL HEATMAPS)
+# - Method 4: loan_need_factor_b > 0  (shadow included, strictly positive gap)
+# - Annual frequency
+# - Countries alphabetical
+# - 5 discrete deterministic bins (quantiles)
+# - Colours: green -> yellow -> orange -> red -> purple (highest severity)
+# - '*' in bottom-right if n < 20
+# ============================================================================
+n_star_threshold <- 20L
+
+# ---- Discrete severity palette (low -> high) ----
+gap_cols <- c(
+  "Very low"  = "#2E7D32",  # green
+  "Low"       = "#F9A825",  # yellow
+  "Medium"    = "#EF6C00",  # orange
+  "High"      = "#C62828",  # red
+  "Very high" = "#6A1B9A"   # purple (most severe)
+)
+
+gap_levels <- names(gap_cols)
+
+# ============================================================================
+# E.1 Build Method-4 dataset (strictly positive gap)
+# ============================================================================
+df_m4 <- df %>%
+  filter(loan_need_factor_b > 0) %>%   # Method 4 definition
+  mutate(
+    wave_agg = as.integer(round(wave_agg)),
+    semi_idx  = wave_agg - 11L,
+    semi_year = 2014L + (semi_idx %/% 2L),
+    q_idx  = wave_agg - 30L,
+    q_year = 2024L + (q_idx %/% 2L),
+    year = if_else(wave_agg <= 29L, semi_year, q_year),
+    d0 = factor(d0, levels = sort(unique(as.character(d0))))  # alphabetical
+  )
+
+# ============================================================================
+# E.2 Deterministic 5-bin classification (quantile-based)
+# ============================================================================
+make_gap_bins <- function(x) {
+  qs <- quantile(x, probs = c(0.2, 0.4, 0.6, 0.8), na.rm = TRUE)
+  cut(
+    x,
+    breaks = c(-Inf, qs[1], qs[2], qs[3], qs[4], Inf),
+    labels = gap_levels,
+    include.lowest = TRUE
+  )
+}
+
+# ============================================================================
+# E.3 Country × Year
+# ============================================================================
+hm_cy <- df_m4 %>%
+  filter(!is.na(d0), !is.na(year), !is.na(loan_financing_need_b), !is.na(wgtcommon)) %>%
+  group_by(d0, year) %>%
+  summarise(
+    gap_eur = weighted_mean(loan_financing_need_b, wgtcommon),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gap_group = make_gap_bins(gap_eur),
+    gap_group = factor(gap_group, levels = gap_levels),
+    star = if_else(n < n_star_threshold, "*", ""),
+    year = factor(year, levels = sort(unique(year)))
+  )
+
+p_hm_country_year <- ggplot(hm_cy, aes(x = d0, y = year, fill = gap_group)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = star),
+    nudge_x = 0.42, nudge_y = -0.42,
+    hjust = 1, vjust = 1,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = gap_cols, drop = FALSE) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave("Heatmap_country_year_method4.pdf",
+       p_hm_country_year, width = 12, height = 6, units = "in")
+
+# ============================================================================
+# E.4 Country × Sector  (drop NA and drop sector == 9)
+# ============================================================================
+
+sector_labels <- c(
+  "1" = "Industry/Manufacturing",
+  "2" = "Construction",
+  "3" = "Trade",
+  "4" = "Services",
+  "5" = "Other"
+)
+
+hm_cs <- df_m4 %>%
+  mutate(d3_rec = as.numeric(d3_rec)) %>%   # <-- FORCE numeric
+  filter(!is.na(d0),
+         !is.na(d3_rec),
+         d3_rec != 9,                 
+         !is.na(loan_financing_need_b),
+         !is.na(wgtcommon)) %>%
+  mutate(
+    sector_code = as.character(d3_rec),
+    sector = if_else(sector_code %in% names(sector_labels),
+                     sector_labels[sector_code],
+                     paste0("Sector ", sector_code)),
+    sector = factor(sector)
+  ) %>%
+  group_by(d0, sector) %>%
+  summarise(
+    gap_eur = weighted_mean(loan_financing_need_b, wgtcommon),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gap_group = make_gap_bins(gap_eur),
+    gap_group = factor(gap_group, levels = gap_levels),
+    star = if_else(n < n_star_threshold, "*", "")
+  )
+
+p_hm_country_sector <- ggplot(hm_cs, aes(x = d0, y = sector, fill = gap_group)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = star),
+    nudge_x = 0.42, nudge_y = -0.42,
+    hjust = 1, vjust = 1,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = gap_cols, drop = FALSE) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+print(p_hm_country_sector)
+
+ggsave(
+  filename = "Heatmap_country_sector_method4_NEW.pdf",
+  plot     = p_hm_country_sector,
+  width    = 12, height = 5, units = "in"
+)
+# ============================================================================
+# E.5 Country × Size
+# ============================================================================
+size_labels <- c(
+  "1" = "Micro (1–9)",
+  "2" = "Small (10–49)",
+  "3" = "Medium (50–249)",
+  "4" = "Large (250+)"
+)
+
+hm_csize <- df_m4 %>%
+  filter(!is.na(d0), !is.na(d1_rec), !is.na(loan_financing_need_b), !is.na(wgtcommon)) %>%
+  mutate(
+    size_code  = as.character(d1_rec),
+    size_class = if_else(size_code %in% names(size_labels),
+                         size_labels[size_code],
+                         paste0("Size ", size_code)),
+    size_class = factor(size_class, levels = unname(size_labels))
+  ) %>%
+  group_by(d0, size_class) %>%
+  summarise(
+    gap_eur = weighted_mean(loan_financing_need_b, wgtcommon),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gap_group = make_gap_bins(gap_eur),
+    gap_group = factor(gap_group, levels = gap_levels),
+    star = if_else(n < n_star_threshold, "*", "")
+  )
+
+p_hm_country_size <- ggplot(hm_csize, aes(x = d0, y = size_class, fill = gap_group)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = star),
+            nudge_x = 0.42, nudge_y = -0.42,
+            hjust = 1, vjust = 1,
+            size = 3, show.legend = FALSE) +
+  scale_fill_manual(values = gap_cols, drop = FALSE) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+ggsave("Heatmap_country_size_method4.pdf",
+       p_hm_country_size, width = 12, height = 5, units = "in")
+
+print(p_hm_country_year)
+print(p_hm_country_sector)
+print(p_hm_country_size)
