@@ -43,7 +43,7 @@ path_out_tvd  <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.dta"
 path_out_metrics_csv <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.csv"
 path_out_metrics_tex <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.tex"
 
-path_out_heatmap <- "C:/Università/Tesi 3/Figures/Heatmap_GapLogErr_V6_midpoint.pdf"
+path_out_heatmap <- "C:/Università/Tesi 3/Figures/Heatmap_GapLogErr_Model_I.pdf"
 
 n_cores <- max(1L, detectCores())
 
@@ -378,7 +378,7 @@ for (i in seq_len(nrow(grid))) {
   params <- list(
     loss_function       = "MultiClass",
     eval_metric         = "MultiClass",
-    iterations          = 3000L,
+    iterations          = 10L,
     learning_rate       = grid$learning_rate[i],
     depth               = grid$depth[i],
     l2_leaf_reg         = grid$l2_leaf_reg[i],
@@ -445,7 +445,7 @@ final_model <- catboost.train(all_pool, params = final_params)
 # BLOCK 8 — Holdout evaluation
 # ==============================================================================
 diag_params <- modifyList(final_params, list(
-  iterations     = 3000L,
+  iterations     = 10L,
   use_best_model = TRUE,
   od_type        = "Iter",
   od_wait        = 100
@@ -945,7 +945,7 @@ cat("\nSaved Figure 3 imputation bands:", path_out_fig3_bands, "\n")
 
 
 # ==============================================================================
-# BLOCK 11 — Export Table 10 metrics (CSV + LaTeX)
+# BLOCK 11 — Export Table metrics (CSV + LaTeX)
 # ==============================================================================
 test_waves_label <- paste(test_waves, collapse = ", ")
 
@@ -1021,7 +1021,7 @@ tex_lines <- c(
 )
 writeLines(tex_lines, path_out_metrics_tex)
 
-cat("\nSaved Table 10 metrics:\n - CSV:", path_out_metrics_csv,
+cat("\nSaved Table metrics:\n - CSV:", path_out_metrics_csv,
     "\n - TEX:", path_out_metrics_tex, "\n")
 
 t1 <- Sys.time()
@@ -1051,29 +1051,50 @@ has_d1_heat <- "d1_rec" %in% names(heatmap_df)
 if (has_d3)      hs <- agg_fun(heatmap_df, "d3_rec")
 if (has_d1_heat) hz <- agg_fun(heatmap_df, "d1_rec")
 
-all_v     <- c(if (has_d3) hs$mean_log_err else NULL,
-               if (has_d1_heat) hz$mean_log_err else NULL)
-sl        <- ceiling(max(abs(all_v), na.rm = TRUE) * 10) / 10
-bk        <- quantile(all_v[is.finite(all_v)], c(0.10, 0.90), na.rm = TRUE)
-bk_scaled <- scales::rescale(c(-sl, bk[[1]], 0, bk[[2]], sl), from = c(-sl, sl))
+all_v <- c(if (has_d3) hs$mean_log_err else NULL,
+           if (has_d1_heat) hz$mean_log_err else NULL)
+sl    <- ceiling(max(abs(all_v), na.rm = TRUE) * 10) / 10
+bk    <- quantile(all_v[is.finite(all_v)], c(0.10, 0.90), na.rm = TRUE)
 
 sector_labels <- c("1" = "Industry", "2" = "Construction", "3" = "Trade",  "4" = "Services")
 size_labels   <- c("1" = "Micro",    "2" = "Small",        "3" = "Medium", "4" = "Large")
 
 make_panel2 <- function(df, y_label, panel_title, label_map = NULL) {
   if (!is.null(label_map)) df <- df %>% mutate(y_cat = recode(y_cat, !!!label_map))
-  ggplot(df, aes(x = d0, y = y_cat, fill = mean_log_err)) +
-    geom_tile(colour = "grey60", linewidth = 0.4) +
+  
+  abs_vals <- abs(df$mean_log_err[is.finite(df$mean_log_err)])
+  
+  df <- df %>%
+    mutate(
+      abs_err   = abs(mean_log_err),
+      sign_char = if_else(mean_log_err >= 0, "+", "\u2212"),
+      txt_col   = if_else(abs(mean_log_err) > 0.45 * sl, "white", "grey10")
+    )
+  
+  bk_bw <- scales::rescale(
+    quantile(abs_vals, c(0, 0.33, 0.66, 1), na.rm = TRUE),
+    from = range(abs_vals)
+  )
+  
+  ggplot(df, aes(x = d0, y = y_cat, fill = abs_err)) +
+    geom_tile(colour = "grey50", linewidth = 0.3) +
+    geom_text(
+      aes(label = sign_char, colour = txt_col),
+      size = 3.2, fontface = "plain", family = "sans"
+    ) +
+    scale_colour_identity() +
     geom_text(
       data = filter(df, small_n),
-      aes(x = d0, y = y_cat, label = "*"),   # x and y explicit since inherit.aes = FALSE
-      inherit.aes = FALSE, colour = "grey40", size = 3.2,
+      aes(x = d0, y = y_cat, label = "*"),
+      inherit.aes = FALSE, colour = "grey50", size = 3.0,
       nudge_x = 0.33, nudge_y = -0.33
     ) +
     scale_fill_gradientn(
-      colours = c("#00429d", "#73adde", "#f7f7f7", "#f4a100", "#93003a"),
-      values  = bk_scaled, limits = c(-sl, sl), oob = scales::squish,
-      name    = "log(1+gap)\nerror\n[pred\u2212true]"
+      colours = c("grey97", "grey60", "grey25", "grey5"),
+      values  = bk_bw,
+      limits  = c(0, sl),
+      oob     = scales::squish,
+      name    = "log(1+gap)\n|error|"
     ) +
     labs(title = panel_title, x = "Country (d0)", y = y_label) +
     theme_minimal(base_size = 9) +
@@ -1086,10 +1107,9 @@ make_panel2 <- function(df, y_label, panel_title, label_map = NULL) {
     )
 }
 
-
 panels <- list()
-if (has_d3)      panels <- c(panels, list(make_panel2(hs, "Sector (d3_rec)",    "Panel A \u2014 Country \u00d7 Sector",     sector_labels)))
-if (has_d1_heat) panels <- c(panels, list(make_panel2(hz, "Firm size (d1_rec)", "Panel B \u2014 Country \u00d7 Size class", size_labels)))
+if (has_d3)      panels <- c(panels, list(make_panel2(hs, "Sector (d3)",    "Panel A \u2014 Country \u00d7 Sector",     sector_labels)))
+if (has_d1_heat) panels <- c(panels, list(make_panel2(hz, "Firm size (d1)", "Panel B \u2014 Country \u00d7 Size Class", size_labels)))
 
 ggsave(path_out_heatmap, Reduce(`/`, panels), width = 14, height = 10, units = "in", device = "pdf")
 cat("\nSaved:", path_out_heatmap, "\n")
