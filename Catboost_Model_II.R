@@ -2,17 +2,26 @@
 # Method B — Model II (Version 6)
 # CatBoost regression on Q8A midpoint + snap back to SAFE midpoints
 #
-# Goal of this script:
-#   1) Create numeric target q8a_midpoint from observed Q8A bins
-#   2) Train CatBoost regression (RMSE) to predict midpoints
-#   3) Run a time-aware wave holdout (diagnostic only)
-#   4) Report comparison metrics (Table 10)
-#   5) Fit the final model on all observed q8a_midpoint
-#   6) Impute missing q8a_midpoint and SNAP to the 5 SAFE midpoints
-#   7) Merge imputed midpoints back to the “general” SAFE dataset
-
+# Pipeline:
+#   0)  Paths + runtime knobs
+#   1)  Helpers (metrics + credibility tables + coerce_wave_to_int)
+#   2)  Load + clean data
+#       2.1  Load raw data, aggregate quarterly waves, deduplicate
+#       2.2  Apply sample filters + q8a cleaning + create q8a_midpoint
+#   3)  Feature selection + NA encoding
+#   4)  Model matrix prep
+#   5)  Time-aware holdout split
+#   6)  Grid search (diagnostic)
+#   7)  Final model (fit on all observed q8a_midpoint)
+#   8)  Holdout evaluation
+#   9)  Snap imputation on FULL dataset_A
+#   10) Merge imputed midpoints back to general SAFE dataset
+#   11) Export Table 10 metrics (CSV + LaTeX)
+#   12) Heatmap: log(1+gap) error by country × sector/size
 ################################################################################
 
+library(ggplot2)
+library(patchwork)
 library(tidyverse)
 library(haven)
 library(catboost)
@@ -25,22 +34,20 @@ t0 <- Sys.time()
 # ==============================================================================
 # BLOCK 0 — Paths + runtime knobs
 # ==============================================================================
-path_in       <- "C:/Università/Tesi 3/ecb.SAFE_microdata/safepanel_allrounds.dta"
-path_out_data <- "C:/Università/Tesi 3/Dataset_Method_B_V6_midpoint_MERGED.dta"
+path_raw             <- "C:/Università/Tesi 3/ecb.SAFE_microdata/safepanel_allrounds.dta"
+path_out_data        <- "C:/Università/Tesi 3/Dataset_Model_II.dta"
 
-path_out_dist <- "C:/Università/Tesi 3/Comparison Metrics/Method_B_Diag_dist_V6_midpoint.dta"
-path_out_tvd  <- "C:/Università/Tesi 3/Comparison Metrics/Method_B_Diag_tvd_V6_midpoint.dta"
+path_out_dist        <- "C:/Università/Tesi 3/Comparison Metrics/Model_II_dist.dta"
+path_out_tvd         <- "C:/Università/Tesi 3/Comparison Metrics/Model_II_tvd.dta"
 
-path_out_metrics_csv <- "C:/Università/Tesi 3/Comparison Metrics/Method_B_TestMetrics_V6_midpoint.csv"
-path_out_metrics_tex <- "C:/Università/Tesi 3/Comparison Metrics/Method_B_TestMetrics_V6_midpoint.tex"
+path_out_metrics_csv <- "C:/Università/Tesi 3/Comparison Metrics/Model_II.csv"
+path_out_metrics_tex <- "C:/Università/Tesi 3/Comparison Metrics/Model_II.tex"
+path_out_heatmap     <- "C:/Università/Tesi 3/Figures/Heatmap_GapLogErr_Model_II.pdf"
 
-n_cores <- max(1L, detectCores(logical = TRUE))
+n_cores <- max(1L, detectCores())
 
-# Fixed bin order used in the thesis (Table 10)
 BIN_LEVELS <- c("1", "2", "5", "6", "4")
-n_classes  <- length(BIN_LEVELS)
 
-# Midpoints used for €-space evaluation and final merged output
 MIDPOINTS_MAP <- c(
   "1" = 12500,
   "2" = 62500,
@@ -48,22 +55,56 @@ MIDPOINTS_MAP <- c(
   "6" = 625000,
   "4" = 1500000
 )
-mp_vec  <- as.numeric(MIDPOINTS_MAP[BIN_LEVELS])
+mp_vec    <- as.numeric(MIDPOINTS_MAP[BIN_LEVELS])
+n_classes <- length(BIN_LEVELS)
 
 # ==============================================================================
-# BLOCK 1 — Helpers (metrics + credibility tables)
+# BLOCK 1 — Helpers
 # ==============================================================================
 
-rmse  <- function(p, y) sqrt(mean((p - y)^2, na.rm = TRUE))
-mae   <- function(p, y) mean(abs(p - y), na.rm = TRUE)
-medae <- function(p, y) median(abs(p - y), na.rm = TRUE)
+coerce_wave_to_int <- function(x) {
+  if (is.numeric(x)) return(as.integer(x))
+  if (!is.null(attr(x, "labels"))) {
+    s <- as.character(haven::as_factor(x))
+    if (all(grepl("^\\s*-?\\d+\\s*$", na.omit(s)))) return(as.integer(s))
+  }
+  s <- as.character(x)
+  if (all(grepl("^\\s*-?\\d+\\s*$", na.omit(s)))) return(as.integer(s))
+  as.integer(as.numeric(s))
+}
 
+missingness_informative_num <- function(data, var, target, p_thresh = 0.20) {
+  keep_rows <- is.finite(data[[target]])
+  d <- data[keep_rows, , drop = FALSE]
+  miss_flag <- is.na(d[[var]])
+  if (all(!miss_flag)) return(TRUE)
+  if (all(miss_flag))  return(FALSE)
+  y0 <- log1p(d[[target]][!miss_flag])
+  y1 <- log1p(d[[target]][ miss_flag])
+  if (length(y0) < 10 || length(y1) < 10) return(TRUE)
+  pval <- suppressWarnings(tryCatch(t.test(y0, y1)$p.value, error = function(e) NA_real_))
+  !is.na(pval) && pval < p_thresh
+}
+
+quadratic_weighted_kappa <- function(truth_int, pred_int, k) {
+  O <- as.matrix(table(factor(truth_int, levels = 1:k),
+                       factor(pred_int,  levels = 1:k)))
+  N <- sum(O)
+  if (N == 0) return(NA_real_)
+  E <- outer(rowSums(O), colSums(O)) / N
+  W <- outer(1:k, 1:k, function(i, j) ((i - j)^2) / ((k - 1)^2))
+  1 - (sum(W * O) / sum(W * E))
+}
+
+rmse        <- function(p, y) sqrt(mean((p - y)^2, na.rm = TRUE))
+mae         <- function(p, y) mean(abs(p - y), na.rm = TRUE)
+medae       <- function(p, y) median(abs(p - y), na.rm = TRUE)
 bias_mean   <- function(p, y) mean(p - y, na.rm = TRUE)
 bias_median <- function(p, y) median(p - y, na.rm = TRUE)
 
 r2 <- function(p, y) {
   ok <- is.finite(p) & is.finite(y)
-  y <- y[ok]; p <- p[ok]
+  y  <- y[ok]; p <- p[ok]
   if (length(y) < 2) return(NA_real_)
   ss_res <- sum((y - p)^2)
   ss_tot <- sum((y - mean(y))^2)
@@ -75,69 +116,38 @@ spearman_fun <- function(p, y) {
   suppressWarnings(cor(p, y, method = "spearman", use = "complete.obs"))
 }
 
-# Option C missingness-informativeness test (numeric target on log1p scale)
-missingness_informative_num <- function(data, var, target, p_thresh = 0.20) {
-  keep_rows <- is.finite(data[[target]])
-  d <- data[keep_rows, , drop = FALSE]
-
-  miss_flag <- is.na(d[[var]])
-  if (all(!miss_flag)) return(TRUE)
-  if (all(miss_flag))  return(FALSE)
-
-  y0 <- log1p(d[[target]][!miss_flag])
-  y1 <- log1p(d[[target]][ miss_flag])
-  if (length(y0) < 10 || length(y1) < 10) return(TRUE)
-
-  pval <- suppressWarnings(tryCatch(t.test(y0, y1)$p.value, error = function(e) NA_real_))
-  !is.na(pval) && pval < p_thresh
+to_numeric_safe <- function(x) {
+  if (inherits(x, "haven_labelled")) return(as.numeric(x))
+  if (is.factor(x))    return(suppressWarnings(as.numeric(as.character(x))))
+  if (is.character(x)) return(suppressWarnings(as.numeric(x)))
+  suppressWarnings(as.numeric(x))
 }
 
-quadratic_weighted_kappa <- function(truth_int, pred_int, k) {
-  O <- table(factor(truth_int, levels = 1:k), factor(pred_int, levels = 1:k))
-  O <- as.matrix(O)
-  N <- sum(O)
-  if (N == 0) return(NA_real_)
-
-  row_m <- rowSums(O)
-  col_m <- colSums(O)
-  E <- outer(row_m, col_m) / N
-
-  W <- outer(1:k, 1:k, function(i, j) ((i - j)^2) / ((k - 1)^2))
-  1 - (sum(W * O) / sum(W * E))
-}
-
-# Deterministic snap to nearest of the 5 midpoints.
-# (Includes range clamping, as in original V6.)
 snap_midpoints <- function(x, mp_vec, y_levels) {
-  x2 <- pmin(pmax(x, min(mp_vec)), max(mp_vec))
+  x2  <- pmin(pmax(x, min(mp_vec)), max(mp_vec))
   idx <- sapply(x2, function(v) which.min(abs(mp_vec - v)))
   list(
     pred_mid_snap = mp_vec[idx],
-    pred_int      = idx,          # 1..K
-    pred_bin      = y_levels[idx] # code in BIN_LEVELS
+    pred_int      = idx,
+    pred_bin      = y_levels[idx]
   )
 }
 
-# Credibility tables: distributions and TVD (overall / by group)
 make_dist <- function(df, y_levels, group_vars = NULL) {
   if (is.null(group_vars) || length(group_vars) == 0) {
-    df <- df %>% mutate(grp = "ALL")
+    df         <- df %>% mutate(grp = "ALL")
     group_vars <- "grp"
   }
-
   ct_true <- df %>%
     count(across(all_of(group_vars)), q8a_true_bin, name = "n_true") %>%
     rename(bin = q8a_true_bin)
-
   ct_pred <- df %>%
     count(across(all_of(group_vars)), q8a_pred_bin, name = "n_pred") %>%
     rename(bin = q8a_pred_bin)
-
   grid2 <- tidyr::crossing(
     df %>% distinct(across(all_of(group_vars))),
     bin = factor(y_levels, levels = y_levels, ordered = TRUE)
   )
-
   dist <- grid2 %>%
     left_join(ct_true, by = c(group_vars, "bin")) %>%
     left_join(ct_pred, by = c(group_vars, "bin")) %>%
@@ -152,11 +162,10 @@ make_dist <- function(df, y_levels, group_vars = NULL) {
       diff_share = share_pred - share_true
     ) %>%
     ungroup()
-
   tvd_tbl <- dist %>%
     group_by(across(all_of(group_vars))) %>%
     summarise(
-      n = sum(n_true),
+      n   = sum(n_true),
       tvd = 0.5 * sum(abs(share_pred - share_true)),
       .groups = "drop"
     ) %>%
@@ -171,16 +180,13 @@ make_dist <- function(df, y_levels, group_vars = NULL) {
         ),
       by = group_vars
     )
-
   list(dist = dist, tvd = tvd_tbl)
 }
 
-# Tail-risk diagnostics (Table 10)
 tail_risk_metrics <- function(true_int, pred_int, true_mid, pred_mid_snap) {
-  Kmax <- max(true_int, na.rm = TRUE)
-  Kmin <- min(true_int, na.rm = TRUE)
+  Kmax   <- max(true_int, na.rm = TRUE)
+  Kmin   <- min(true_int, na.rm = TRUE)
   ae_eur <- abs(pred_mid_snap - true_mid)
-
   list(
     big_mistake_rate  = mean(abs(pred_int - true_int) >= 2, na.rm = TRUE),
     ae_p95_eur        = as.numeric(quantile(ae_eur, 0.95, na.rm = TRUE)),
@@ -195,22 +201,70 @@ tail_risk_metrics <- function(true_int, pred_int, true_mid, pred_mid_snap) {
   )
 }
 
+relative_error <- function(p, y) {
+  rel <- (p - y) / y
+  rel[!is.finite(rel)] <- NA_real_
+  rel
+}
+
+gap_metrics <- function(p, y) {
+  rel <- relative_error(p, y)
+  list(
+    rmse          = rmse(p, y),
+    mae           = mae(p, y),
+    medae         = medae(p, y),
+    spearman      = spearman_fun(p, y),
+    r2            = r2(p, y),
+    bias_mean     = bias_mean(p, y),
+    bias_median   = bias_median(p, y),
+    relerr_mean   = if (all(is.na(rel))) NA_real_ else mean(rel,   na.rm = TRUE),
+    relerr_median = if (all(is.na(rel))) NA_real_ else median(rel, na.rm = TRUE),
+    n             = sum(is.finite(p) & is.finite(y))
+  )
+}
+
 # ==============================================================================
-# BLOCK 2 — Load + clean data (q8a only)
-#   * non-EU countries are dropped
-#   * non-relevant waves are dropped
-#   * ony observations representing the effective demand are kept
-#   * vulnerable firms are dropped
-#   * useless variables are dropped
-#   * q8a == 9 (DK/NA) treated as missing
+# BLOCK 2 — Load + clean data
 # ==============================================================================
-dataset_A <- read_dta(path_in) %>%
+
+# --- 2.1  Load raw data, aggregate quarterly waves, deduplicate ---------------
+#
+#   Semiannual regime (waves 1–29): wave_agg = wave (unchanged)
+#   Quarterly regime  (waves 30+):  consecutive quarter-pairs collapsed into
+#                                   sequential semiannual indices:
+#     30–31 (2024 Q1–Q2) → 30 (2024 H1)
+#     32–33 (2024 Q3–Q4) → 31 (2024 H2)
+#     34–35 (2025 Q1–Q2) → 32 (2025 H1)
+#     36–37 (2025 Q3–Q4) → 33 (2025 H2)
+#
+#   Deduplication: one row per (permid, wave_agg); for the ~980 firms appearing
+#   in both quarters of the same half-year, the earlier quarter's record is kept.
+
+dat_agg <- read_dta(path_raw) %>%
+  mutate(
+    permid    = as.character(permid),
+    orig_wave = coerce_wave_to_int(wave),
+    wave_agg  = case_when(
+      orig_wave %in% c(30L, 31L) ~ 30L,
+      orig_wave %in% c(32L, 33L) ~ 31L,
+      orig_wave %in% c(34L, 35L) ~ 32L,
+      orig_wave %in% c(36L, 37L) ~ 33L,
+      TRUE                       ~ orig_wave
+    )
+  ) %>%
+  arrange(permid, wave_agg, orig_wave) %>%
+  distinct(permid, wave_agg, .keep_all = TRUE) %>%
+  select(-orig_wave)
+
+for (a in c("label", "datalabel", "notes")) attr(dat_agg, a) <- NULL
+
+# --- 2.2  Apply sample filters + q8a cleaning + create q8a_midpoint ----------
+dataset_A_raw <- dat_agg %>%
   filter(
     d0 %in% c("BE","DK","DE","EE","IE","GR","ES","FR","HR","IT",
               "CY","LV","LT","LU","MT","NL","AT","PL","PT","RO",
               "SI","SK","FI","SE","BG","CZ","HU"),
-    wave > 10,
-    !wave %in% c(31, 33, 35),
+    wave_agg > 10,
     q7a_a %in% c(1, 2) | q32 %in% c(1, 2, 3, 4, 5, 6)
   ) %>%
   select(
@@ -218,66 +272,79 @@ dataset_A <- read_dta(path_in) %>%
        ida, experiment_1, experiment_2, intdate),
     -any_of("q8a_rec")
   ) %>%
-  arrange(permid, wave) %>%
-  mutate(across(where(haven::is.labelled), haven::as_factor)) %>%
+  arrange(permid, wave_agg)
+
+dataset_A <- dataset_A_raw %>%
   mutate(
-    # q8a cleaning
+    across(
+      -c(permid, wave_agg),
+      ~ if (inherits(.x, "haven_labelled")) haven::as_factor(.x) else as.factor(.x)
+    ),
     q8a = as.character(q8a),
     q8a = stringr::str_trim(q8a),
     q8a = dplyr::na_if(q8a, ""),
     q8a = stringr::str_extract(q8a, "\\d+"),
     q8a = ifelse(q8a == "9", NA_character_, q8a),
-    q8a = factor(q8a, levels = BIN_LEVELS, ordered = TRUE),
-
-    # numeric midpoint target
+    q8a = factor(q8a),
     q8a_midpoint = as.numeric(MIDPOINTS_MAP[as.character(q8a)])
   )
 
-cat("Step 1 completed | Rows:", nrow(dataset_A),
+cat("2.2 done | Rows:", nrow(dataset_A),
     "| Columns:", ncol(dataset_A),
-    "| Missing q8a_midpoint:", sum(!is.finite(dataset_A$q8a_midpoint)), "\n")
+    "| Missing q8a:", sum(is.na(dataset_A$q8a)),
+    "| Obs q8a_midpoint:", sum(is.finite(dataset_A$q8a_midpoint)), "\n")
 
 # ==============================================================================
-# BLOCK 3 — Feature selection + NA encoding (hybrid rule) with leakage control
+# BLOCK 3 — Feature selection + NA encoding (hybrid rule)
 # ==============================================================================
-id_vars    <- c("permid", "wave", "d0")
+id_vars    <- c("permid", "wave_agg", "d0")
 target_var <- "q8a_midpoint"
+leak_vars  <- c("q8a", "q8a_rec", grep("q8a.*mid", names(dataset_A), value = TRUE))
+leak_vars  <- setdiff(unique(leak_vars), target_var)
 
-# Leakage: exclude q8a, q8a_rec, and any q8a*mid* columns from predictors
-leak_vars_all  <- unique(c("q8a", "q8a_rec", grep("q8a.*mid", names(dataset_A), value = TRUE)))
-leak_vars_pred <- setdiff(leak_vars_all, target_var)
+hard_drop  <- names(which(colMeans(is.na(dataset_A)) > 0.90))
+dataset_A  <- dataset_A %>% select(-all_of(hard_drop))
 
-# 1) Drop almost-empty variables (>90% NA)
-hard_drop <- names(which(colMeans(is.na(dataset_A)) > 0.90))
-dataset_A <- dataset_A %>% select(-all_of(hard_drop))
-
-# 2) Option C selection (numeric target)
-candidate_vars <- setdiff(names(dataset_A), c(id_vars, target_var, leak_vars_pred))
-vars_to_keep <- candidate_vars[
-  sapply(candidate_vars, function(v) missingness_informative_num(dataset_A, v, target_var))
+candidate_vars <- setdiff(names(dataset_A), c(id_vars, target_var, leak_vars))
+vars_to_keep   <- candidate_vars[
+  sapply(candidate_vars, function(v)
+    missingness_informative_num(dataset_A, v, target_var))
 ]
-
-# Force keep q7a_a if present
 vars_to_keep <- union(vars_to_keep, intersect("q7a_a", names(dataset_A)))
 
-# Keep id + q8a (for bin diagnostics) + target + selected predictors
 dataset_A <- dataset_A %>%
   select(all_of(c(id_vars, "q8a", target_var, vars_to_keep)))
 
-# 3) Explicit NA encoding for factor predictors only (exclude id + q8a + target)
 pred_cols <- setdiff(names(dataset_A), c(id_vars, "q8a", target_var))
 dataset_A <- dataset_A %>%
-  mutate(across(all_of(pred_cols), ~ if (is.factor(.x)) forcats::fct_explicit_na(.x, "MISSING") else .x))
+  mutate(across(all_of(pred_cols),
+                ~ if (is.factor(.x)) forcats::fct_explicit_na(.x, "MISSING") else .x))
 
-cat("Step 2 completed | Columns after missingness control:", ncol(dataset_A), "\n")
+cat("Step 3 completed | Columns after missingness control:", ncol(dataset_A), "\n")
 
 # ==============================================================================
-# BLOCK 4 — Model matrices (single X_full to ensure factor-level compatibility)
+# BLOCK 4 — Model matrix prep (observed q8a_midpoint only)
 # ==============================================================================
-obs_idx <- which(is.finite(dataset_A[[target_var]]))
+model_df <- dataset_A %>% filter(is.finite(.data[[target_var]]))
 
-remove_from_X <- unique(c("permid", target_var, leak_vars_pred))
+y_all         <- model_df[[target_var]]
+true_code_all <- as.character(model_df$q8a)
+true_int_all  <- match(true_code_all, BIN_LEVELS)   # 1..K
+true_cls_all  <- true_int_all - 1L                  # 0..K-1
 
+remove_from_X <- unique(c("permid", "wave_agg", target_var, leak_vars))
+
+X_all <- model_df %>%
+  select(-any_of(remove_from_X)) %>%
+  mutate(across(where(is.character), ~ {
+    x <- stringr::str_trim(.x)
+    x <- dplyr::na_if(x, "")
+    as.factor(x)
+  })) %>%
+  mutate(across(where(is.factor), ~ forcats::fct_explicit_na(.x, "MISSING"))) %>%
+  as.data.frame()
+
+# Build X_full aligned on full dataset_A (needed for imputation in Block 9)
 X_full <- dataset_A %>%
   select(-any_of(remove_from_X)) %>%
   mutate(across(where(is.character), ~ {
@@ -288,34 +355,26 @@ X_full <- dataset_A %>%
   mutate(across(where(is.factor), ~ forcats::fct_explicit_na(.x, "MISSING"))) %>%
   as.data.frame()
 
-model_df <- dataset_A[obs_idx, , drop = FALSE]
-X_all    <- X_full[obs_idx, , drop = FALSE]
-y_all    <- model_df[[target_var]]
-
+obs_idx       <- which(is.finite(dataset_A[[target_var]]))
 feature_names <- names(X_all)
 
-# True bins for weights + diagnostics
-true_code_all <- as.character(model_df$q8a)
-true_int_all  <- match(true_code_all, BIN_LEVELS)      # 1..K
-true_cls_all  <- true_int_all - 1L                     # 0..K-1
-
-cat("Step 3 completed | Observed target rows:", length(obs_idx),
+cat("Step 4 completed | Observed rows:", nrow(model_df),
     "| X columns:", ncol(X_all), "\n")
 
 # ==============================================================================
-# BLOCK 5 — Time-aware holdout split by wave (diagnostic only) + weights
+# BLOCK 5 — Time-aware holdout split by wave_agg (diagnostic only)
 # ==============================================================================
-uniq_waves <- sort(unique(model_df$wave))
+uniq_waves <- sort(unique(model_df$wave_agg))
 test_n     <- max(1L, floor(0.20 * length(uniq_waves)))
 test_waves <- tail(uniq_waves, test_n)
 
-train_idx <- which(!model_df$wave %in% test_waves)
-test_idx  <- which( model_df$wave %in% test_waves)
+train_idx <- which(!model_df$wave_agg %in% test_waves)
+test_idx  <- which( model_df$wave_agg %in% test_waves)
 
-freq_train <- table(true_cls_all[train_idx])
-w_map      <- median(as.numeric(freq_train)) / as.numeric(freq_train)
+freq_train   <- table(true_cls_all[train_idx])
+w_map        <- median(as.numeric(freq_train)) / as.numeric(freq_train)
 names(w_map) <- names(freq_train)
-w_train <- as.numeric(w_map[as.character(true_cls_all[train_idx])])
+w_train      <- as.numeric(w_map[as.character(true_cls_all[train_idx])])
 w_train[is.na(w_train)] <- 1
 
 train_pool <- catboost.load_pool(
@@ -323,15 +382,13 @@ train_pool <- catboost.load_pool(
   label  = y_all[train_idx],
   weight = w_train
 )
-
 test_pool <- catboost.load_pool(
   X_all[test_idx, , drop = FALSE],
   label = y_all[test_idx]
 )
 
 # ==============================================================================
-# BLOCK 6 — One-shot grid search on holdout waves (REGRESSION)
-#   * Metric: RMSE on the numeric midpoint
+# BLOCK 6 — One-shot grid search on holdout waves (diagnostic only)
 # ==============================================================================
 grid <- expand.grid(
   depth         = c(5, 6, 8),
@@ -343,51 +400,50 @@ results <- vector("list", nrow(grid))
 
 for (i in seq_len(nrow(grid))) {
   params <- list(
-    loss_function  = "RMSE",
-    eval_metric    = "RMSE",
-    iterations     = 3000,
-    learning_rate  = grid$learning_rate[i],
-    depth          = grid$depth[i],
-    l2_leaf_reg    = grid$l2_leaf_reg[i],
-    od_type        = "Iter",
-    od_wait        = 50,
-    random_seed    = 123,
-    thread_count   = n_cores,
-    use_best_model = TRUE,
-    logging_level  = "Silent"
+    loss_function       = "RMSE",
+    eval_metric         = "RMSE",
+    iterations          = 3000L,
+    learning_rate       = grid$learning_rate[i],
+    depth               = grid$depth[i],
+    l2_leaf_reg         = grid$l2_leaf_reg[i],
+    od_type             = "Iter",
+    od_wait             = 100,
+    random_seed         = 123,
+    thread_count        = n_cores,
+    use_best_model      = TRUE,
+    logging_level       = "Silent",
+    allow_writing_files = FALSE
   )
-
-  m <- catboost.train(train_pool, test_pool, params = params)
+  
+  m      <- catboost.train(train_pool, test_pool, params = params)
   pred_i <- as.numeric(catboost.predict(m, test_pool))
   rmse_i <- rmse(pred_i, y_all[test_idx])
-
-  best_iter_i <- tryCatch(catboost.get_best_iteration(m), error = function(e) NA_integer_)
-  if (!is.na(best_iter_i)) best_iter_i <- best_iter_i + 1L
-  if (is.na(best_iter_i))  best_iter_i <- params$iterations
-
+  
+  best_iter_i <- tryCatch(catboost.get_best_iteration(m) + 1L,
+                          error = function(e) params$iterations)
+  
   results[[i]] <- list(params = grid[i, ], best_iter = best_iter_i, rmse = rmse_i)
-
-  cat(sprintf(
-    "Grid %02d/%02d | RMSE %.1f | Iter %d | depth=%d lr=%.3f l2=%d\n",
-    i, nrow(grid), rmse_i, best_iter_i,
-    grid$depth[i], grid$learning_rate[i], grid$l2_leaf_reg[i]
-  ))
+  
+  cat(sprintf("Grid %02d/%02d | RMSE %.1f | Iter %d | depth=%d lr=%.3f l2=%d\n",
+              i, nrow(grid), rmse_i, best_iter_i,
+              grid$depth[i], grid$learning_rate[i], grid$l2_leaf_reg[i]))
+  
+  rm(m, pred_i); gc()
 }
 
 best_id <- which.min(sapply(results, `[[`, "rmse"))
 best    <- results[[best_id]]
 
-cat("\nBest grid choice:\n")
-print(best$params)
+cat("\nBest grid choice:\n"); print(best$params)
 cat(sprintf("Best holdout RMSE: %.1f | Best iteration: %d\n", best$rmse, best$best_iter))
 
 # ==============================================================================
 # BLOCK 7 — Final model (fit on ALL observed q8a_midpoint)
 # ==============================================================================
-freq_all  <- table(true_cls_all)
-w_map_all <- median(as.numeric(freq_all)) / as.numeric(freq_all)
+freq_all         <- table(true_cls_all)
+w_map_all        <- median(as.numeric(freq_all)) / as.numeric(freq_all)
 names(w_map_all) <- names(freq_all)
-w_all <- as.numeric(w_map_all[as.character(true_cls_all)])
+w_all            <- as.numeric(w_map_all[as.character(true_cls_all)])
 w_all[is.na(w_all)] <- 1
 
 all_pool <- catboost.load_pool(X_all, label = y_all, weight = w_all)
@@ -407,47 +463,38 @@ final_params <- list(
 final_model <- catboost.train(all_pool, params = final_params)
 
 # ==============================================================================
-# BLOCK 8 — Holdout diagnostics (Table 10)
-#   * Bin-space metrics from SNAPPED predictions
-#   * TVD + mean shifts on bin distributions
-#   * € / log1p metrics on SNAPPED midpoints
-#   * Tail-risk diagnostics on SNAPPED midpoints
+# BLOCK 8 — Holdout evaluation
 # ==============================================================================
+diag_params <- modifyList(final_params, list(
+  iterations     = 3000L,
+  use_best_model = TRUE,
+  od_type        = "Iter",
+  od_wait        = 100
+))
 
-# Diagnostic model with early stopping (same pattern as V5)
-diag_params <- final_params
-diag_params$iterations     <- 3000
-diag_params$use_best_model <- TRUE
-diag_params$od_type        <- "Iter"
-diag_params$od_wait        <- 80
-
-diag_model <- catboost.train(train_pool, test_pool, params = diag_params)
-
-# Continuous midpoint prediction on holdout (used only as input to snapping)
+diag_model  <- catboost.train(train_pool, test_pool, params = diag_params)
 pred_mid_ev <- as.numeric(catboost.predict(diag_model, test_pool))
 
 true_code <- as.character(model_df$q8a[test_idx])
 true_mid  <- as.numeric(MIDPOINTS_MAP[true_code])
+true_int  <- match(true_code, BIN_LEVELS)
 
-snap <- snap_midpoints(pred_mid_ev, mp_vec, BIN_LEVELS)
+snap          <- snap_midpoints(pred_mid_ev, mp_vec, BIN_LEVELS)
 pred_mid_snap <- snap$pred_mid_snap
 pred_int      <- snap$pred_int
 pred_bin      <- snap$pred_bin
 
-true_int <- match(true_code, BIN_LEVELS)
-
-# ---- Bin-space metrics (Table 10) ----
+# ---- Bin-space metrics ----
 acc_exact   <- mean(pred_int == true_int, na.rm = TRUE)
 acc_within1 <- mean(abs(pred_int - true_int) <= 1L, na.rm = TRUE)
 qwk         <- quadratic_weighted_kappa(true_int, pred_int, n_classes)
 
-cm <- confusionMatrix(
-  factor(pred_int, levels = 1:n_classes, labels = BIN_LEVELS, ordered = TRUE),
-  factor(true_int, levels = 1:n_classes, labels = BIN_LEVELS, ordered = TRUE)
-)
-macro_f1 <- if (is.matrix(cm$byClass)) mean(cm$byClass[, "F1"], na.rm = TRUE) else unname(cm$byClass["F1"])
+pred_factor <- factor(pred_int, levels = 1:n_classes, labels = BIN_LEVELS, ordered = TRUE)
+obs_factor  <- factor(true_int, levels = 1:n_classes, labels = BIN_LEVELS, ordered = TRUE)
+cm          <- confusionMatrix(pred_factor, obs_factor)
+macro_f1    <- if (is.matrix(cm$byClass)) mean(cm$byClass[, "F1"], na.rm = TRUE) else unname(cm$byClass["F1"])
 
-# ---- Credibility diagnostics (TVD) ----
+# ---- Credibility (TVD) ----
 eval_df <- model_df[test_idx, ] %>%
   mutate(
     q8a_true_int = true_int,
@@ -456,38 +503,69 @@ eval_df <- model_df[test_idx, ] %>%
     q8a_pred_bin = factor(pred_bin,  levels = BIN_LEVELS, ordered = TRUE)
   )
 
+extra_grp   <- intersect(c("d1", "d2"), names(dataset_A_raw))
+missing_grp <- setdiff(extra_grp, names(eval_df))
+if (length(missing_grp) > 0) {
+  eval_df <- eval_df %>%
+    left_join(dataset_A_raw %>% select(permid, wave_agg, all_of(missing_grp)),
+              by = c("permid", "wave_agg"))
+}
+
 overall    <- make_dist(eval_df, BIN_LEVELS)
-by_wave    <- make_dist(eval_df, BIN_LEVELS, c("wave"))
-by_country <- make_dist(eval_df, BIN_LEVELS, c("d0"))
+by_wave    <- make_dist(eval_df, BIN_LEVELS, "wave_agg")
+by_country <- make_dist(eval_df, BIN_LEVELS, "d0")
+by_sector  <- if ("d1" %in% names(eval_df)) make_dist(eval_df, BIN_LEVELS, "d1") else NULL
+by_size    <- if ("d2" %in% names(eval_df)) make_dist(eval_df, BIN_LEVELS, "d2") else NULL
 
-dist_all <- bind_rows(
-  overall$dist    %>% mutate(scope = "overall", wave = NA_real_, d0 = NA_character_) %>% select(scope, wave, d0, everything()),
-  by_wave$dist    %>% mutate(scope = "wave",   d0 = NA_character_)                  %>% select(scope, wave, d0, everything()),
-  by_country$dist %>% mutate(scope = "d0",     wave = NA_real_)                     %>% select(scope, wave, d0, everything())
+dist_list <- list(
+  overall$dist    %>% mutate(scope = "overall"),
+  by_wave$dist    %>% mutate(scope = "wave_agg"),
+  by_country$dist %>% mutate(scope = "d0")
+)
+tvd_list <- list(
+  overall$tvd    %>% mutate(scope = "overall"),
+  by_wave$tvd    %>% mutate(scope = "wave_agg"),
+  by_country$tvd %>% mutate(scope = "d0")
 )
 
-tvd_all <- bind_rows(
-  overall$tvd    %>% mutate(scope = "overall", wave = NA_real_, d0 = NA_character_) %>% select(scope, wave, d0, everything()),
-  by_wave$tvd    %>% mutate(scope = "wave",   d0 = NA_character_)                   %>% select(scope, wave, d0, everything()),
-  by_country$tvd %>% mutate(scope = "d0",     wave = NA_real_)                      %>% select(scope, wave, d0, everything())
-)
+if (!is.null(by_sector)) {
+  dist_list <- c(dist_list, list(by_sector$dist %>% mutate(scope = "d1")))
+  tvd_list  <- c(tvd_list,  list(by_sector$tvd  %>% mutate(scope = "d1")))
+}
+if (!is.null(by_size)) {
+  dist_list <- c(dist_list, list(by_size$dist %>% mutate(scope = "d2")))
+  tvd_list  <- c(tvd_list,  list(by_size$tvd  %>% mutate(scope = "d2")))
+}
+
+dist_all <- bind_rows(dist_list) %>%
+  relocate(scope, any_of(c("grp", "wave_agg", "d0", "d1", "d2")))
+tvd_all  <- bind_rows(tvd_list)  %>%
+  relocate(scope, any_of(c("grp", "wave_agg", "d0", "d1", "d2")))
 
 write_dta(dist_all, path_out_dist)
 write_dta(tvd_all,  path_out_tvd)
 
-overall_tvd       <- overall$tvd$tvd[1]
-avg_tvd_by_wave   <- mean(by_wave$tvd$tvd, na.rm = TRUE)
-avg_tvd_by_country<- mean(by_country$tvd$tvd, na.rm = TRUE)
+overall_tvd               <- overall$tvd$tvd[1]
+avg_tvd_by_wave           <- mean(by_wave$tvd$tvd,    na.rm = TRUE)
+avg_tvd_by_country        <- mean(by_country$tvd$tvd, na.rm = TRUE)
+avg_tvd_by_sector         <- if (!is.null(by_sector)) mean(by_sector$tvd$tvd, na.rm = TRUE) else NA_real_
+avg_tvd_by_size           <- if (!is.null(by_size))   mean(by_size$tvd$tvd,   na.rm = TRUE) else NA_real_
 
-# ---- € and log1p(€) metrics (snapped) ----
+overall_mean_shift        <- overall$tvd$mean_shift[1]
+avg_mean_shift_by_wave    <- mean(by_wave$tvd$mean_shift,    na.rm = TRUE)
+avg_mean_shift_by_country <- mean(by_country$tvd$mean_shift, na.rm = TRUE)
+avg_mean_shift_by_sector  <- if (!is.null(by_sector)) mean(by_sector$tvd$mean_shift, na.rm = TRUE) else NA_real_
+avg_mean_shift_by_size    <- if (!is.null(by_size))   mean(by_size$tvd$mean_shift,   na.rm = TRUE) else NA_real_
+
+# ---- €-space metrics (snapped midpoints) ----
 metrics_eur <- list(
-  rmse_eur         = rmse(pred_mid_snap, true_mid),
-  mae_eur          = mae(pred_mid_snap, true_mid),
-  medae_eur        = medae(pred_mid_snap, true_mid),
-  spearman_eur     = spearman_fun(pred_mid_snap, true_mid),
-  r2_eur           = r2(pred_mid_snap, true_mid),
-  bias_mean_eur    = bias_mean(pred_mid_snap, true_mid),
-  bias_median_eur  = bias_median(pred_mid_snap, true_mid)
+  rmse_eur        = rmse(pred_mid_snap, true_mid),
+  mae_eur         = mae(pred_mid_snap, true_mid),
+  medae_eur       = medae(pred_mid_snap, true_mid),
+  spearman_eur    = spearman_fun(pred_mid_snap, true_mid),
+  r2_eur          = r2(pred_mid_snap, true_mid),
+  bias_mean_eur   = bias_mean(pred_mid_snap, true_mid),
+  bias_median_eur = bias_median(pred_mid_snap, true_mid)
 )
 
 pred_log <- log1p(pred_mid_snap)
@@ -503,49 +581,134 @@ metrics_log <- list(
   bias_median_log1p = bias_median(pred_log, true_log)
 )
 
-# ---- Tail-risk diagnostics ----
 tail <- tail_risk_metrics(true_int, pred_int, true_mid, pred_mid_snap)
 
-cat("\n================ HOLDOUT (Table 10 metrics only) ================\n")
-cat(sprintf("Exact accuracy            : %.4f\n", acc_exact))
-cat(sprintf("Within-1 accuracy         : %.4f\n", acc_within1))
-cat(sprintf("Quadratic weighted kappa  : %.4f\n", qwk))
-cat(sprintf("Macro F1                  : %.4f\n\n", macro_f1))
-cat(sprintf("Overall TVD (bins)        : %.4f\n", overall_tvd))
-cat(sprintf("Avg. TVD by wave          : %.4f\n", avg_tvd_by_wave))
-cat(sprintf("Avg. TVD by country       : %.4f\n\n", avg_tvd_by_country))
-cat(sprintf("RMSE (€)                  : %.1f\n", metrics_eur$rmse_eur))
-cat(sprintf("MAE  (€)                  : %.1f\n", metrics_eur$mae_eur))
-cat(sprintf("Median AE (€)             : %.1f\n", metrics_eur$medae_eur))
-cat(sprintf("Spearman (€)              : %.4f\n", metrics_eur$spearman_eur))
-cat(sprintf("R2 (€)                    : %.4f\n", metrics_eur$r2_eur))
-cat(sprintf("Bias mean (€)             : %.1f\n", metrics_eur$bias_mean_eur))
-cat(sprintf("Bias median (€)           : %.1f\n\n", metrics_eur$bias_median_eur))
-cat(sprintf("RMSE (log)                : %.4f\n", metrics_log$rmse_log1p))
-cat(sprintf("MAE  (log)                : %.4f\n", metrics_log$mae_log1p))
-cat(sprintf("Median AE (log)           : %.4f\n", metrics_log$medae_log1p))
-cat(sprintf("Spearman (log)            : %.4f\n", metrics_log$spearman_log1p))
-cat(sprintf("R2 (log)                  : %.4f\n", metrics_log$r2_log1p))
-cat(sprintf("Bias mean (log)           : %.4f\n", metrics_log$bias_mean_log1p))
-cat(sprintf("Bias median (log)         : %.4f\n\n", metrics_log$bias_median_log1p))
-cat(sprintf("Big mistake rate (|Δbin|≥2): %.8f\n", tail$big_mistake_rate))
-cat(sprintf("AE p95 (€)                : %.1f\n", tail$ae_p95_eur))
-cat(sprintf("Top-bin underpred rate    : %.8f\n", tail$topbin_under_rate))
-cat(sprintf("Catastrophic flip rate    : %.8f\n", tail$catastrophic_rate))
+# ---- Euro financing gap metrics ----
+gap_base <- model_df[test_idx, c("permid", "wave_agg")] %>%
+  left_join(dataset_A_raw, by = c("permid", "wave_agg")) %>%
+  mutate(
+    loan_demanded_true = true_mid,
+    loan_demanded_pred = pred_mid_snap,
+    q7a_a_num      = to_numeric_safe(q7a_a),
+    q7b_a_num      = to_numeric_safe(q7b_a),
+    q32_num        = to_numeric_safe(q32),
+    vulnerable_num = if ("vulnerable" %in% names(.)) to_numeric_safe(vulnerable) else NA_real_,
+    q32_clean      = if_else(q7a_a_num == 1 | !is.na(q7b_a_num), NA_real_, q32_num),
+    loan_need_factor_a = case_when(
+      q7a_a_num == 3 | q7b_a_num == 1 ~ 0,
+      q7b_a_num == 5                  ~ 0.2,
+      q7b_a_num == 6                  ~ 0.8,
+      q7b_a_num %in% c(3, 4)          ~ 1,
+      TRUE                            ~ NA_real_
+    ),
+    loan_need_factor_b = case_when(
+      q7a_a_num == 2                                       ~ 1,
+      !is.na(q32_clean) & q32_clean >= 1 & q32_clean <= 6 ~ 1,
+      TRUE                                                 ~ loan_need_factor_a
+    ),
+    loan_gap_a_true = case_when(
+      loan_need_factor_a == 0 ~ 0,
+      loan_need_factor_a >  0 ~ loan_need_factor_a * loan_demanded_true,
+      TRUE                    ~ NA_real_
+    ),
+    loan_gap_a_pred = case_when(
+      loan_need_factor_a == 0 ~ 0,
+      loan_need_factor_a >  0 ~ loan_need_factor_a * loan_demanded_pred,
+      TRUE                    ~ NA_real_
+    ),
+    loan_gap_b_true = case_when(
+      loan_need_factor_b == 0 ~ 0,
+      loan_need_factor_b >  0 ~ loan_need_factor_b * loan_demanded_true,
+      TRUE                    ~ NA_real_
+    ),
+    loan_gap_b_pred = case_when(
+      loan_need_factor_b == 0 ~ 0,
+      loan_need_factor_b >  0 ~ loan_need_factor_b * loan_demanded_pred,
+      TRUE                    ~ NA_real_
+    )
+  )
+
+gap_eval_df <- if ("vulnerable" %in% names(gap_base)) {
+  gap_base %>% filter(is.na(vulnerable_num) | vulnerable_num == 0)
+} else {
+  gap_base
+}
+
+metrics_gap_a <- gap_metrics(gap_eval_df$loan_gap_a_pred, gap_eval_df$loan_gap_a_true)
+metrics_gap_b <- gap_metrics(gap_eval_df$loan_gap_b_pred, gap_eval_df$loan_gap_b_true)
+
+# ---- Console output ----
+cat("\n================ TABLE: Out-of-time performance on ordered brackets (bin-space) ================\n")
+
+cat("\n--- Accuracy metrics ---\n")
+cat(sprintf("Exact accuracy              : %.4f\n", acc_exact))
+cat(sprintf("Within-1 accuracy           : %.4f\n", acc_within1))
+cat(sprintf("Quadratic weighted kappa    : %.4f\n", qwk))
+cat(sprintf("Macro F1                    : %.4f\n", macro_f1))
+
+cat("\n--- Distributional credibility (bracket shares) ---\n")
+cat(sprintf("Overall TVD (bins)          : %.4f\n", overall_tvd))
+cat(sprintf("Avg TVD by wave             : %.4f\n", avg_tvd_by_wave))
+cat(sprintf("Avg TVD by country          : %.4f\n", avg_tvd_by_country))
+cat(sprintf("Avg TVD by sector           : %.4f\n", avg_tvd_by_sector))
+cat(sprintf("Avg TVD by size             : %.4f\n", avg_tvd_by_size))
+cat(sprintf("Overall mean shift (bins)   : %.4f\n", overall_mean_shift))
+cat(sprintf("Avg mean shift by country   : %.4f\n", avg_mean_shift_by_country))
+cat(sprintf("Avg mean shift by sector    : %.4f\n", avg_mean_shift_by_sector))
+cat(sprintf("Avg mean shift by size      : %.4f\n", avg_mean_shift_by_size))
+
+cat("\n--- Tail-risk diagnostics ---\n")
+cat(sprintf("Big mistake rate (|Δbin|≥2) : %.6f\n", tail$big_mistake_rate))
+cat(sprintf("Top-bin underprediction rate: %.6f\n", tail$topbin_under_rate))
+cat(sprintf("Catastrophic flip rate      : %.6f\n", tail$catastrophic_rate))
+
+cat("\n================ TABLE: Out-of-time performance on euro-valued midpoints ================\n")
+
+cat("\n--- €-space (snapped midpoints) ---\n")
+cat(sprintf("RMSE (€)                    : %.1f\n",  metrics_eur$rmse_eur))
+cat(sprintf("MAE (€)                     : %.1f\n",  metrics_eur$mae_eur))
+cat(sprintf("Median AE (€)               : %.1f\n",  metrics_eur$medae_eur))
+cat(sprintf("Spearman (€)                : %.4f\n", metrics_eur$spearman_eur))
+cat(sprintf("R2 (€)                      : %.4f\n", metrics_eur$r2_eur))
+cat(sprintf("Bias mean (€)               : %.1f\n",  metrics_eur$bias_mean_eur))
+cat(sprintf("Bias median (€)             : %.1f\n",  metrics_eur$bias_median_eur))
+
+cat("\n--- log1p(€)-space ---\n")
+cat(sprintf("RMSE (log1p)                : %.4f\n", metrics_log$rmse_log1p))
+cat(sprintf("MAE (log1p)                 : %.4f\n", metrics_log$mae_log1p))
+cat(sprintf("Median AE (log1p)           : %.4f\n", metrics_log$medae_log1p))
+cat(sprintf("Spearman (log1p)            : %.4f\n", metrics_log$spearman_log1p))
+cat(sprintf("R2 (log1p)                  : %.4f\n", metrics_log$r2_log1p))
+cat(sprintf("Bias mean (log1p)           : %.4f\n", metrics_log$bias_mean_log1p))
+cat(sprintf("Bias median (log1p)         : %.4f\n", metrics_log$bias_median_log1p))
+
+cat("\n================ TABLE: Out-of-time performance on financing gap (gap-space) ================\n")
+cat(sprintf("N used (gap eval)           : %d\n", metrics_gap_a$n))
+
+cat("\n--- Gap A (loan_financing_need_a) ---\n")
+cat(sprintf("RMSE (€)        : %.1f\n",  metrics_gap_a$rmse))
+cat(sprintf("MAE (€)         : %.1f\n",  metrics_gap_a$mae))
+cat(sprintf("Spearman        : %.4f\n", metrics_gap_a$spearman))
+cat(sprintf("R2              : %.4f\n", metrics_gap_a$r2))
+
+cat("\n--- Gap B (loan_financing_need_b) ---\n")
+cat(sprintf("RMSE (€)        : %.1f\n",  metrics_gap_b$rmse))
+cat(sprintf("MAE (€)         : %.1f\n",  metrics_gap_b$mae))
+cat(sprintf("Spearman        : %.4f\n", metrics_gap_b$spearman))
+cat(sprintf("R2              : %.4f\n", metrics_gap_b$r2))
 
 # ==============================================================================
-# BLOCK 9 — Impute missing midpoint and SNAP to the 5 SAFE midpoints
+# BLOCK 9 — Snap imputation on FULL dataset_A
 # ==============================================================================
 mid_was_missing <- !is.finite(dataset_A[[target_var]])
-miss_idx <- which(mid_was_missing)
-
-q8a_midpoints <- dataset_A[[target_var]]  # observed midpoints already mapped from q8a
+miss_idx        <- which(mid_was_missing)
+q8a_midpoints   <- dataset_A[[target_var]]
 
 if (length(miss_idx) > 0) {
-  X_miss <- X_full[miss_idx, feature_names, drop = FALSE]
-  miss_pool <- catboost.load_pool(X_miss)
+  X_miss       <- X_full[miss_idx, feature_names, drop = FALSE]
+  miss_pool    <- catboost.load_pool(X_miss)
   pred_miss_ev <- as.numeric(catboost.predict(final_model, miss_pool))
-  snap_miss <- snap_midpoints(pred_miss_ev, mp_vec, BIN_LEVELS)
+  snap_miss    <- snap_midpoints(pred_miss_ev, mp_vec, BIN_LEVELS)
   q8a_midpoints[miss_idx] <- snap_miss$pred_mid_snap
 }
 
@@ -556,88 +719,197 @@ dataset_A <- dataset_A %>%
   )
 
 # ==============================================================================
-# BLOCK 10 — Merge imputed midpoints back to GENERAL dataset
+# BLOCK 10 — Merge imputed midpoints back to general SAFE dataset
 # ==============================================================================
 q8a_mid_tbl <- dataset_A %>%
-  transmute(permid, wave, q8a_midpoints, q8a_imp_flag)
+  transmute(permid, wave_agg, q8a_midpoints, q8a_imp_flag)
 
-dataset_general <- read_dta(path_in) %>%
+dataset_general <- dat_agg %>%
   filter(
     d0 %in% c("BE","DK","DE","EE","IE","GR","ES","FR","HR","IT",
               "CY","LV","LT","LU","MT","NL","AT","PL","PT","RO",
               "SI","SK","FI","SE","BG","CZ","HU"),
-    wave > 10,
-    !wave %in% c(31, 33, 35)
+    wave_agg > 10
   ) %>%
-  arrange(permid, wave) %>%
-  left_join(q8a_mid_tbl, by = c("permid", "wave"))
+  arrange(permid, wave_agg) %>%
+  left_join(q8a_mid_tbl, by = c("permid", "wave_agg"))
 
 write_dta(dataset_general, path_out_data)
 cat("\nSaved merged dataset:", path_out_data, "\n")
+cat("Rows:", nrow(dataset_general),
+    "| Imputed:", sum(dataset_general$q8a_imp_flag == 1L, na.rm = TRUE), "\n")
 
 # ==============================================================================
-# BLOCK 11 — Export Table 10 metrics table (CSV + LaTeX)
+# BLOCK 11 — Export Tables metrics (CSV + LaTeX)
 # ==============================================================================
 test_waves_label <- paste(test_waves, collapse = ", ")
 
 metrics_tbl <- tribble(
   ~section, ~metric, ~value,
-  "Setup", "Holdout waves (by wave)", test_waves_label,
+  "Setup", "Holdout waves",          test_waves_label,
   "Setup", "N holdout observations", as.character(length(test_idx)),
-
-  "Bin-space", "Exact accuracy", sprintf("%.4f", acc_exact),
-  "Bin-space", "Within-1 accuracy", sprintf("%.4f", acc_within1),
+  
+  "Bin-space", "Exact accuracy",           sprintf("%.4f", acc_exact),
+  "Bin-space", "Within-1 accuracy",        sprintf("%.4f", acc_within1),
   "Bin-space", "Quadratic weighted kappa", sprintf("%.4f", qwk),
-  "Bin-space", "Macro F1", sprintf("%.4f", macro_f1),
-
-  "Distribution (TVD)", "Overall TVD (bins)", sprintf("%.4f", overall_tvd),
-  "Distribution (TVD)", "Avg. TVD by wave", sprintf("%.4f", avg_tvd_by_wave),
+  "Bin-space", "Macro F1",                 sprintf("%.4f", macro_f1),
+  
+  "Distribution (TVD)", "Overall TVD",         sprintf("%.4f", overall_tvd),
+  "Distribution (TVD)", "Avg. TVD by wave",    sprintf("%.4f", avg_tvd_by_wave),
   "Distribution (TVD)", "Avg. TVD by country", sprintf("%.4f", avg_tvd_by_country),
-
-  "€-space (snapped midpoints)", "RMSE (€)", sprintf("%.1f", metrics_eur$rmse_eur),
-  "€-space (snapped midpoints)", "MAE (€)", sprintf("%.1f", metrics_eur$mae_eur),
-  "€-space (snapped midpoints)", "Median AE (€)", sprintf("%.1f", metrics_eur$medae_eur),
-  "€-space (snapped midpoints)", "Spearman", sprintf("%.4f", metrics_eur$spearman_eur),
-  "€-space (snapped midpoints)", "R2", sprintf("%.4f", metrics_eur$r2_eur),
-  "€-space (snapped midpoints)", "Bias mean", sprintf("%.1f", metrics_eur$bias_mean_eur),
-  "€-space (snapped midpoints)", "Bias median", sprintf("%.1f", metrics_eur$bias_median_eur),
-
-  "log1p(€) (snapped midpoints)", "RMSE (log)", sprintf("%.4f", metrics_log$rmse_log1p),
-  "log1p(€) (snapped midpoints)", "MAE (log)", sprintf("%.4f", metrics_log$mae_log1p),
-  "log1p(€) (snapped midpoints)", "Median AE (log)", sprintf("%.4f", metrics_log$medae_log1p),
-  "log1p(€) (snapped midpoints)", "Spearman (log)", sprintf("%.4f", metrics_log$spearman_log1p),
-  "log1p(€) (snapped midpoints)", "R2 (log)", sprintf("%.4f", metrics_log$r2_log1p),
-  "log1p(€) (snapped midpoints)", "Bias mean (log)", sprintf("%.4f", metrics_log$bias_mean_log1p),
-  "log1p(€) (snapped midpoints)", "Bias median (log)", sprintf("%.4f", metrics_log$bias_median_log1p),
-
-  "Tail-risk (snapped midpoints)", "Big mistake rate (|Δbin| ≥ 2)", sprintf("%.8f", tail$big_mistake_rate),
-  "Tail-risk (snapped midpoints)", "AE p95 (€)", sprintf("%.1f", tail$ae_p95_eur),
-  "Tail-risk (snapped midpoints)", "Top-bin underprediction rate", sprintf("%.8f", tail$topbin_under_rate),
-  "Tail-risk (snapped midpoints)", "Catastrophic flip rate (bottom↔top)", sprintf("%.8f", tail$catastrophic_rate)
+  "Distribution (TVD)", "Avg. TVD by sector",  sprintf("%.4f", avg_tvd_by_sector),
+  "Distribution (TVD)", "Avg. TVD by size",    sprintf("%.4f", avg_tvd_by_size),
+  
+  "Distribution (Mean shift)", "Overall mean shift",         sprintf("%.4f", overall_mean_shift),
+  "Distribution (Mean shift)", "Avg. mean shift by country", sprintf("%.4f", avg_mean_shift_by_country),
+  "Distribution (Mean shift)", "Avg. mean shift by sector",  sprintf("%.4f", avg_mean_shift_by_sector),
+  "Distribution (Mean shift)", "Avg. mean shift by size",    sprintf("%.4f", avg_mean_shift_by_size),
+  
+  "€-space", "RMSE (€)",      sprintf("%.1f",  metrics_eur$rmse_eur),
+  "€-space", "MAE (€)",       sprintf("%.1f",  metrics_eur$mae_eur),
+  "€-space", "Median AE (€)", sprintf("%.1f",  metrics_eur$medae_eur),
+  "€-space", "Spearman",      sprintf("%.4f", metrics_eur$spearman_eur),
+  "€-space", "R2",            sprintf("%.4f", metrics_eur$r2_eur),
+  "€-space", "Bias mean",     sprintf("%.1f",  metrics_eur$bias_mean_eur),
+  "€-space", "Bias median",   sprintf("%.1f",  metrics_eur$bias_median_eur),
+  
+  "log1p(€)", "RMSE",        sprintf("%.4f", metrics_log$rmse_log1p),
+  "log1p(€)", "MAE",         sprintf("%.4f", metrics_log$mae_log1p),
+  "log1p(€)", "Median AE",   sprintf("%.4f", metrics_log$medae_log1p),
+  "log1p(€)", "Spearman",    sprintf("%.4f", metrics_log$spearman_log1p),
+  "log1p(€)", "R2",          sprintf("%.4f", metrics_log$r2_log1p),
+  "log1p(€)", "Bias mean",   sprintf("%.4f", metrics_log$bias_mean_log1p),
+  "log1p(€)", "Bias median", sprintf("%.4f", metrics_log$bias_median_log1p),
+  
+  "Tail-risk", "Big mistake rate (|Δbin|≥2)",        sprintf("%.8f", tail$big_mistake_rate),
+  "Tail-risk", "AE p95 (€)",                         sprintf("%.1f",  tail$ae_p95_eur),
+  "Tail-risk", "Top-bin underprediction rate",        sprintf("%.8f", tail$topbin_under_rate),
+  "Tail-risk", "Catastrophic flip rate (bottom↔top)", sprintf("%.8f", tail$catastrophic_rate),
+  
+  "€-gap (vulnerable==0)", "N used",               as.character(metrics_gap_a$n),
+  "€-gap A", "RMSE (€)",      sprintf("%.1f",  metrics_gap_a$rmse),
+  "€-gap A", "MAE (€)",       sprintf("%.1f",  metrics_gap_a$mae),
+  "€-gap A", "Spearman",      sprintf("%.4f", metrics_gap_a$spearman),
+  "€-gap A", "R2",            sprintf("%.4f", metrics_gap_a$r2),
+  "€-gap A", "Rel. err mean", sprintf("%.6f", metrics_gap_a$relerr_mean),
+  "€-gap B", "RMSE (€)",      sprintf("%.1f",  metrics_gap_b$rmse),
+  "€-gap B", "MAE (€)",       sprintf("%.1f",  metrics_gap_b$mae),
+  "€-gap B", "Spearman",      sprintf("%.4f", metrics_gap_b$spearman),
+  "€-gap B", "R2",            sprintf("%.4f", metrics_gap_b$r2),
+  "€-gap B", "Rel. err mean", sprintf("%.6f", metrics_gap_b$relerr_mean)
 )
 
 readr::write_csv(metrics_tbl, path_out_metrics_csv)
 
 tex_lines <- c(
   "\\begin{table}[!htbp]\\centering",
-  "\\caption{Holdout comparison metrics for Method B (Model II: CatBoost regression + snap)}",
+  "\\caption{Holdout comparison metrics — Method B, Model II (CatBoost Regression + Snap)}",
   "\\label{tab:methodB_table10_modelII}",
   "\\begin{tabular}{lll}",
   "\\hline",
   "Section & Metric & Value \\\\",
   "\\hline",
-  paste0(metrics_tbl$section, " & ", metrics_tbl$metric, " & ", metrics_tbl$value, " \\\\") ,
+  paste0(metrics_tbl$section, " & ", metrics_tbl$metric, " & ", metrics_tbl$value, " \\\\"),
   "\\hline",
   "\\end{tabular}",
   "\\end{table}"
 )
-
 writeLines(tex_lines, path_out_metrics_tex)
 
-cat("\nSaved Table 10 metrics table:\n")
-cat(" - CSV:", path_out_metrics_csv, "\n")
-cat(" - TEX:", path_out_metrics_tex, "\n")
+cat("\nSaved Table 10 metrics:\n - CSV:", path_out_metrics_csv,
+    "\n - TEX:", path_out_metrics_tex, "\n")
 
 t1 <- Sys.time()
-cat("\nTOTAL runtime:\n")
-print(t1 - t0)
+cat("\nTOTAL runtime:\n"); print(t1 - t0)
+
+# ==============================================================================
+# BLOCK 12 — Heatmap: log(1+gap) error by country × sector/size
+# ==============================================================================
+heatmap_df <- gap_eval_df %>%
+  mutate(
+    d0 = as.character(d0),
+    across(any_of(c("d1_rec", "d3_rec")), ~ as.character(to_numeric_safe(.x)))
+  ) %>%
+  mutate(log_err_b = log1p(loan_gap_b_pred) - log1p(loan_gap_b_true))
+
+agg_fun <- function(df, y_var) {
+  df %>%
+    filter(!is.na(.data[[y_var]]), !is.na(d0), is.finite(log_err_b)) %>%
+    group_by(d0, y_cat = .data[[y_var]]) %>%
+    summarise(mean_log_err = mean(log_err_b, na.rm = TRUE), n = n(), .groups = "drop") %>%
+    mutate(small_n = n < 10)
+}
+
+has_d3      <- "d3_rec" %in% names(heatmap_df)
+has_d1_heat <- "d1_rec" %in% names(heatmap_df)
+
+if (!has_d3 && !has_d1_heat) {
+  cat("\nHeatmap skipped: neither d3_rec nor d1_rec found in holdout data.\n")
+} else {
+  
+  if (has_d3)      hs <- agg_fun(heatmap_df, "d3_rec")
+  if (has_d1_heat) hz <- agg_fun(heatmap_df, "d1_rec")
+  
+  all_v <- c(if (has_d3) hs$mean_log_err else NULL,
+             if (has_d1_heat) hz$mean_log_err else NULL)
+  sl    <- ceiling(max(abs(all_v), na.rm = TRUE) * 10) / 10
+  bk    <- quantile(all_v[is.finite(all_v)], c(0.10, 0.90), na.rm = TRUE)
+  
+  sector_labels <- c("1" = "Industry", "2" = "Construction", "3" = "Trade",  "4" = "Services")
+  size_labels   <- c("1" = "Micro",    "2" = "Small",        "3" = "Medium", "4" = "Large")
+  
+  make_panel2 <- function(df, y_label, panel_title, label_map = NULL) {
+    if (!is.null(label_map)) df <- df %>% mutate(y_cat = recode(y_cat, !!!label_map))
+    
+    abs_vals <- abs(df$mean_log_err[is.finite(df$mean_log_err)])
+    
+    df <- df %>%
+      mutate(
+        abs_err   = abs(mean_log_err),
+        sign_char = if_else(mean_log_err >= 0, "+", "\u2212"),
+        txt_col   = if_else(abs(mean_log_err) > 0.45 * sl, "white", "grey10")
+      )
+    
+    bk_bw <- scales::rescale(
+      quantile(abs_vals, c(0, 0.33, 0.66, 1), na.rm = TRUE),
+      from = range(abs_vals)
+    )
+    
+    ggplot(df, aes(x = d0, y = y_cat, fill = abs_err)) +
+      geom_tile(colour = "grey50", linewidth = 0.3) +
+      geom_text(
+        aes(label = sign_char, colour = txt_col),
+        size = 3.2, fontface = "plain", family = "sans"
+      ) +
+      scale_colour_identity() +
+      geom_text(
+        data = filter(df, small_n),
+        aes(x = d0, y = y_cat, label = "*"),
+        inherit.aes = FALSE, colour = "grey50", size = 3.0,
+        nudge_x = 0.33, nudge_y = -0.33
+      ) +
+      scale_fill_gradientn(
+        colours = c("grey97", "grey60", "grey25", "grey5"),
+        values  = bk_bw,
+        limits  = c(0, sl),
+        oob     = scales::squish,
+        name    = "log(1+gap)\n|error|"
+      ) +
+      labs(title = panel_title, x = "Country (d0)", y = y_label) +
+      theme_minimal(base_size = 9) +
+      theme(
+        axis.text.x       = element_text(angle = 45, hjust = 1, size = 7),
+        axis.text.y       = element_text(size = 8),
+        panel.grid        = element_blank(),
+        plot.title        = element_text(face = "bold", size = 10),
+        legend.key.height = unit(1.8, "cm")
+      )
+  }
+  
+  panels <- list()
+  if (has_d3)      panels <- c(panels, list(make_panel2(hs, "Sector (d3)",    "Panel A \u2014 Country \u00d7 Sector",     sector_labels)))
+  if (has_d1_heat) panels <- c(panels, list(make_panel2(hz, "Firm size (d1)", "Panel B \u2014 Country \u00d7 Size Class", size_labels)))
+  
+  ggsave(path_out_heatmap, Reduce(`/`, panels), width = 14, height = 10, units = "in", device = "pdf")
+  cat("\nSaved:", path_out_heatmap, "\n")
+}
