@@ -143,6 +143,7 @@ imputation_by_wave <- purrr::imap(samples, ~{
 }) %>% bind_rows()
 
 
+
 # ============================================================================
 # BLOCK C: Build semiannual calendar index for plotting
 # ============================================================================
@@ -192,7 +193,35 @@ sem_axis <- gap_time %>%
   arrange(sem_index)
 
 # ============================================================================
-# BLOCK D: Combined figure (Gap + Number of Firms)
+# BLOCK C.1 — Load imputation uncertainty bands for Figure 3
+# (Created by Model I script Block X)
+# ============================================================================
+
+path_bands <- "C:/Università/Tesi 3/Comparison Metrics/Figure3_ImputationBands_Methods1to4.csv"
+
+gap_bands <- readr::read_csv(path_bands, show_col_types = FALSE) %>%
+  mutate(
+    wave_agg = as.integer(round(wave_agg)),
+    method  = factor(method, levels = c("method_1","method_2","method_3","method_4"))
+  ) %>%
+  # attach sem_index and labels using the same mapping as your main series
+  left_join(
+    gap_time %>% distinct(wave_agg, sem_index, year_half, sem_key),
+    by = "wave_agg"
+  )
+
+# Optional but recommended: use the median (p50) as the plotted line,
+# so the line always sits "inside" the ribbon.
+gap_time <- gap_time %>%
+  left_join(
+    gap_bands %>% select(wave_agg, method, gap_p50, gap_p05, gap_p95),
+    by = c("wave_agg","method")
+  ) %>%
+  mutate(gap_eur = if_else(!is.na(gap_p50), gap_p50, gap_eur))
+
+# ============================================================================
+# BLOCK D: Combined figure (Gap + Number of Firms + % Imputed)
+#   D.1 now includes method-specific uncertainty ribbons
 # ============================================================================
 
 cb_palette <- c(
@@ -212,21 +241,53 @@ cb_labels <- c(
 gap_time <- gap_time %>%
   mutate(method = factor(method, levels = c("method_1","method_2","method_3","method_4")))
 
+imp_time <- imp_time %>%
+  mutate(method = factor(method, levels = c("method_1","method_2","method_3","method_4")))
+
 step <- 2L
 sem_breaks_every2 <- sem_axis$sem_index[seq(1, nrow(sem_axis), by = step)]
 sem_labels_every2 <- sem_axis$year_half[seq(1, nrow(sem_axis), by = step)]
 
-
-# D.1 First Panel (Gap Measure)
-p_gap <- ggplot(gap_time, aes(x = sem_index, y = gap_eur, colour = method)) +
+# ----------------------------------------------------------------------------
+# D.1 First Panel (Gap Measure) — WITH BANDS
+# ----------------------------------------------------------------------------
+p_gap <- ggplot() +
   geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.6) +
-  geom_line(linewidth = 0.9) +
-  geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
+  
+  # ribbons first (one per method)
+  geom_ribbon(
+    data = gap_bands,
+    aes(x = sem_index, ymin = gap_p05, ymax = gap_p95, fill = method),
+    alpha = 0.22,          
+    colour = NA
+  ) +
+  
+  # median line + points (gap_time already replaced with gap_p50 above)
+  geom_line(
+    data = gap_time,
+    aes(x = sem_index, y = gap_eur, colour = method),
+    linewidth = 0.9
+  ) +
+  geom_point(
+    data = gap_time,
+    aes(x = sem_index, y = gap_eur, colour = method),
+    size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE
+  ) +
+  
   scale_x_continuous(breaks = sem_breaks_every2, labels = sem_labels_every2) +
-  scale_y_continuous(labels = label_comma(), breaks = pretty_breaks(n = 8),
-                     expand = expansion(mult = c(0.02, 0.05))) +
+  scale_y_continuous(
+    labels = label_comma(),
+    breaks = pretty_breaks(n = 8),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
   scale_colour_manual(values = cb_palette, labels = cb_labels) +
-  labs(x = NULL, y = "Financing gap (EUR)", colour = NULL) +
+  scale_fill_manual(values = cb_palette, guide = "none") +
+  
+  labs(
+    x = NULL,
+    y = "Financing gap (EUR)",
+    colour = NULL
+  ) +
   theme_minimal(base_size = 12) +
   theme(
     panel.grid.major.x = element_blank(),
@@ -239,8 +300,9 @@ p_gap <- ggplot(gap_time, aes(x = sem_index, y = gap_eur, colour = method)) +
     plot.background    = element_rect(fill = "white", colour = NA)
   )
 
-
-# D.2 Second Panel (Samples Dimentions)
+# ----------------------------------------------------------------------------
+# D.2 Second Panel (Sample dimensions)
+# ----------------------------------------------------------------------------
 p_nfirms <- ggplot(gap_time, aes(x = sem_index, y = n, colour = method)) +
   geom_line(linewidth = 0.9) +
   geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
@@ -260,8 +322,9 @@ p_nfirms <- ggplot(gap_time, aes(x = sem_index, y = n, colour = method)) +
     plot.background    = element_rect(fill = "white", colour = NA)
   )
 
-
-# D.3 Third panel (Share of imputed observations)
+# ----------------------------------------------------------------------------
+# D.3 Third Panel (% imputed)
+# ----------------------------------------------------------------------------
 p_imputed <- ggplot(imp_time, aes(x = sem_index, y = share_imputed, colour = method)) +
   geom_line(linewidth = 0.9) +
   geom_point(size = 0.8, alpha = 0.7, stroke = 0, show.legend = FALSE) +
@@ -285,21 +348,18 @@ p_imputed <- ggplot(imp_time, aes(x = sem_index, y = share_imputed, colour = met
     plot.background    = element_rect(fill = "white", colour = NA)
   )
 
-
 combined_plot <- p_gap / p_nfirms / p_imputed +
   plot_layout(heights = c(2, 1, 1))
 
 ggsave(
-  filename = "Weighted Mean Firm-Level Financing Gap.pdf",
+  filename = "Weighted Mean Firm-Level Financing Gap (with imputation bands).pdf",
   plot     = combined_plot,
-  width    = 12,   
-  height   = 14,  
+  width    = 12,
+  height   = 14,
   units    = "in"
 )
 
 print(combined_plot)
-
-
 # ============================================================================
 # BLOCK E (METHOD 4 – DISCRETE ANNUAL HEATMAPS)
 # - Method 4: loan_need_factor_b > 0  (shadow included, strictly positive gap)
@@ -448,7 +508,7 @@ p_hm_country_sector <- ggplot(hm_cs, aes(x = d0, y = sector, fill = gap_group)) 
 print(p_hm_country_sector)
 
 ggsave(
-  filename = "Heatmap_country_sector_method4_NEW.pdf",
+  filename = "Heatmap_country_sector_method4.pdf",
   plot     = p_hm_country_sector,
   width    = 12, height = 5, units = "in"
 )
@@ -501,4 +561,5 @@ ggsave("Heatmap_country_size_method4.pdf",
 
 print(p_hm_country_year)
 print(p_hm_country_sector)
+print(p_hm_country_size)
 print(p_hm_country_size)
