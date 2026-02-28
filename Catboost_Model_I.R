@@ -34,16 +34,17 @@ t0 <- Sys.time()
 # ==============================================================================
 # BLOCK 0 — Paths + runtime knobs
 # ==============================================================================
-path_raw        <- "C:/Università/Tesi 3/ecb.SAFE_microdata/safepanel_allrounds.dta"
-path_out_data   <- "C:/Università/Tesi 3/Dataset_Model_I.dta"
 
-path_out_dist <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.dta"
-path_out_tvd  <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.dta"
+path_raw        <- ""
+path_out_data   <- ""
 
-path_out_metrics_csv <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.csv"
-path_out_metrics_tex <- "C:/Università/Tesi 3/Comparison Metrics/Model_I.tex"
+path_out_dist <- ""
+path_out_tvd  <- ""
 
-path_out_heatmap <- "C:/Università/Tesi 3/Figures/Heatmap_GapLogErr_Model_I.pdf"
+path_out_metrics_csv <- ""
+path_out_metrics_tex <- ""
+
+path_out_heatmap <- ""
 
 n_cores <- max(1L, detectCores())
 
@@ -378,7 +379,7 @@ for (i in seq_len(nrow(grid))) {
   params <- list(
     loss_function       = "MultiClass",
     eval_metric         = "MultiClass",
-    iterations          = 10L,
+    iterations          = 3000L,
     learning_rate       = grid$learning_rate[i],
     depth               = grid$depth[i],
     l2_leaf_reg         = grid$l2_leaf_reg[i],
@@ -445,7 +446,7 @@ final_model <- catboost.train(all_pool, params = final_params)
 # BLOCK 8 — Holdout evaluation
 # ==============================================================================
 diag_params <- modifyList(final_params, list(
-  iterations     = 10L,
+  iterations     = 3000L,
   use_best_model = TRUE,
   od_type        = "Iter",
   od_wait        = 100
@@ -700,14 +701,20 @@ cat(sprintf("N used (gap eval)           : %d\n", metrics_gap_a$n))
 cat("\n--- Gap A (loan_financing_need_a) ---\n")
 cat(sprintf("RMSE (€)        : %.1f\n", metrics_gap_a$rmse))
 cat(sprintf("MAE (€)         : %.1f\n", metrics_gap_a$mae))
+cat(sprintf("Median AE (€)   : %.1f\n", metrics_gap_a$medae))
 cat(sprintf("Spearman        : %.4f\n", metrics_gap_a$spearman))
 cat(sprintf("R2              : %.4f\n", metrics_gap_a$r2))
+cat(sprintf("Bias mean (€)   : %.1f\n", metrics_gap_a$bias_mean))
+cat(sprintf("Bias median (€) : %.1f\n", metrics_gap_a$bias_median))
 
 cat("\n--- Gap B (loan_financing_need_b) ---\n")
 cat(sprintf("RMSE (€)        : %.1f\n", metrics_gap_b$rmse))
 cat(sprintf("MAE (€)         : %.1f\n", metrics_gap_b$mae))
+cat(sprintf("Median AE (€)   : %.1f\n", metrics_gap_b$medae))
 cat(sprintf("Spearman        : %.4f\n", metrics_gap_b$spearman))
 cat(sprintf("R2              : %.4f\n", metrics_gap_b$r2))
+cat(sprintf("Bias mean (€)   : %.1f\n", metrics_gap_b$bias_mean))
+cat(sprintf("Bias median (€) : %.1f\n", metrics_gap_b$bias_median))
 
 # ==============================================================================
 # BLOCK 9 — Probabilistic imputation on FULL dataset_A
@@ -759,193 +766,7 @@ write_dta(dataset_general, path_out_data)
 cat("\nSaved merged dataset:", path_out_data, "\n")
 
 # ==============================================================================
-# BLOCK X — Imputation uncertainty bands
-# Produces: gap_time_bands (wave_agg × method with p50/p05/p95)
-# ==============================================================================
-
-# ---- knobs ----
-M    <- 50L     # if compute tight: 30L is OK
-q_lo <- 0.05
-q_hi <- 0.95
-set.seed(123)
-
-# ---- build the SAME analysis sample used for gap methods (match your Block 2.2 filter) ----
-general_base <- dat_agg %>%
-  filter(
-    d0 %in% c("BE","DK","DE","EE","IE","GR","ES","FR","HR","IT",
-              "CY","LV","LT","LU","MT","NL","AT","PL","PT","RO",
-              "SI","SK","FI","SE","BG","CZ","HU"),
-    wave_agg > 10,
-    q7a_a %in% c(1, 2) | q32 %in% c(1, 2, 3, 4, 5, 6)
-  ) %>%
-  mutate(
-    permid = as.character(permid),
-    wave_agg = as.integer(wave_agg)
-  ) %>%
-  arrange(permid, wave_agg)
-
-# Optional: exclude vulnerable==1 like you do in gap_eval_df
-if ("vulnerable" %in% names(general_base)) {
-  general_base <- general_base %>%
-    mutate(vulnerable_num = to_numeric_safe(vulnerable)) %>%
-    filter(is.na(vulnerable_num) | vulnerable_num == 0)
-}
-
-# ---- weights (pick what you actually use in Figure 3; fallback = unweighted) ----
-weight_candidates <- c("wgt", "wgtcommon", "weight", "w")
-wvar <- weight_candidates[weight_candidates %in% names(general_base)][1]
-w <- if (!is.na(wvar) && length(wvar) == 1L) to_numeric_safe(general_base[[wvar]]) else rep(1, nrow(general_base))
-w[!is.finite(w)] <- 0
-
-# ---- compute need factors ONCE (does not depend on imputation draws) ----
-general_base <- general_base %>%
-  mutate(
-    q7a_a_num = to_numeric_safe(q7a_a),
-    q7b_a_num = if ("q7b_a" %in% names(.)) to_numeric_safe(q7b_a) else NA_real_,
-    q32_num   = to_numeric_safe(q32),
-    q32_clean = if_else(q7a_a_num == 1 | !is.na(q7b_a_num), NA_real_, q32_num),
-    
-    loan_need_factor_a = case_when(
-      q7a_a_num == 3 | q7b_a_num == 1 ~ 0,
-      q7b_a_num == 5                  ~ 0.2,
-      q7b_a_num == 6                  ~ 0.8,
-      q7b_a_num %in% c(3, 4)          ~ 1,
-      TRUE                            ~ NA_real_
-    ),
-    
-    loan_need_factor_b = case_when(
-      q7a_a_num == 2                                       ~ 1,
-      !is.na(q32_clean) & q32_clean >= 1 & q32_clean <= 6   ~ 1,
-      TRUE                                                  ~ loan_need_factor_a
-    )
-  )
-
-# ---- map model rows (dataset_A) back into general_base by (permid, wave_agg) ----
-key_base <- paste(general_base$permid, general_base$wave_agg, sep = "|")
-key_A    <- paste(as.character(dataset_A$permid), as.integer(dataset_A$wave_agg), sep = "|")
-pos_in_base <- match(key_A, key_base)
-
-# sanity: if these NAs are >0, your Figure 3 sample differs from dataset_A_raw filter
-if (anyNA(pos_in_base)) {
-  warning("Some dataset_A rows do not match general_base. Check sample filters used for Figure 3.")
-}
-
-# ---- fixed midpoints for observed q8a (non-missing) ----
-mid_fixed <- rep(NA_real_, nrow(general_base))
-obs_idx_A <- which(!q8a_was_missing & !is.na(pos_in_base))
-mid_fixed[pos_in_base[obs_idx_A]] <- as.numeric(MIDPOINTS_MAP[as.character(dataset_A$q8a[obs_idx_A])])
-
-# missing positions in general_base corresponding to miss_idx in dataset_A
-miss_pos_base <- pos_in_base[miss_idx]
-miss_pos_base <- miss_pos_base[!is.na(miss_pos_base)]
-
-# ---- wave grouping (for fast rowsum) ----
-wave_fac <- factor(as.integer(general_base$wave_agg), levels = sort(unique(as.integer(general_base$wave_agg))))
-wave_levels <- levels(wave_fac)
-
-rowsum_full <- function(x, g) {
-  rs <- rowsum(x, g, reorder = FALSE)
-  out <- setNames(rep(0, length(wave_levels)), wave_levels)
-  out[rownames(rs)] <- rs[, 1]
-  out
-}
-
-# ---- precompute cumulative probs for fast sampling ----
-if (length(miss_idx) > 0) {
-  cumP <- probs_miss
-  for (k in 2:ncol(cumP)) cumP[, k] <- cumP[, k] + cumP[, k - 1]
-}
-
-# ---- storage: M × waves × 4 methods ----
-W <- length(wave_levels)
-res <- array(NA_real_, dim = c(M, W, 4),
-             dimnames = list(NULL, wave_levels, paste0("method_", 1:4)))
-
-need_a <- general_base$loan_need_factor_a
-need_b <- general_base$loan_need_factor_b
-
-idx_a_all <- which(!is.na(need_a))
-idx_b_all <- which(!is.na(need_b))
-
-for (m in seq_len(M)) {
-  
-  mid <- mid_fixed
-  
-  # draw midpoints for missing Q8A rows
-  if (length(miss_idx) > 0 && length(miss_pos_base) > 0) {
-    u <- runif(nrow(cumP))
-    cls <- rowSums(cumP < u) + 1L
-    q8a_draw_chr <- y_levels[cls]
-    mid_draw <- as.numeric(MIDPOINTS_MAP[q8a_draw_chr])
-    mid[miss_pos_base] <- mid_draw
-  }
-  
-  # gaps (0 if need==0; NA if need is NA; midpoint must exist for need>0)
-  gap_a <- rep(NA_real_, nrow(general_base))
-  gap_b <- rep(NA_real_, nrow(general_base))
-  
-  ia <- idx_a_all
-  gap_a[ia] <- ifelse(need_a[ia] == 0, 0,
-                      ifelse(need_a[ia] > 0 & is.finite(mid[ia]), need_a[ia] * mid[ia], NA_real_))
-  
-  ib <- idx_b_all
-  gap_b[ib] <- ifelse(need_b[ib] == 0, 0,
-                      ifelse(need_b[ib] > 0 & is.finite(mid[ib]), need_b[ib] * mid[ib], NA_real_))
-  
-  # Method 1: observed only, full sample (incl zeros)
-  g1 <- gap_a[ia]; w1 <- w[ia]; wf1 <- wave_fac[ia]
-  num1 <- rowsum_full(w1 * ifelse(is.na(g1), 0, g1), wf1)
-  den1 <- rowsum_full(w1, wf1)
-  m1  <- num1 / pmax(den1, 1e-12)
-  
-  # Method 2: observed only, positive only
-  ia2 <- ia[need_a[ia] > 0 & is.finite(gap_a[ia])]
-  g2 <- gap_a[ia2]; w2 <- w[ia2]; wf2 <- wave_fac[ia2]
-  num2 <- rowsum_full(w2 * g2, wf2)
-  den2 <- rowsum_full(w2, wf2)
-  m2  <- num2 / pmax(den2, 1e-12)
-  
-  # Method 3: shadow included, full sample (incl zeros)
-  g3 <- gap_b[ib]; w3 <- w[ib]; wf3 <- wave_fac[ib]
-  num3 <- rowsum_full(w3 * ifelse(is.na(g3), 0, g3), wf3)
-  den3 <- rowsum_full(w3, wf3)
-  m3  <- num3 / pmax(den3, 1e-12)
-  
-  # Method 4: shadow included, positive only
-  ib4 <- ib[need_b[ib] > 0 & is.finite(gap_b[ib])]
-  g4 <- gap_b[ib4]; w4 <- w[ib4]; wf4 <- wave_fac[ib4]
-  num4 <- rowsum_full(w4 * g4, wf4)
-  den4 <- rowsum_full(w4, wf4)
-  m4  <- num4 / pmax(den4, 1e-12)
-  
-  res[m, , 1] <- as.numeric(m1)
-  res[m, , 2] <- as.numeric(m2)
-  res[m, , 3] <- as.numeric(m3)
-  res[m, , 4] <- as.numeric(m4)
-}
-
-summ_one_method <- function(j) {
-  mat <- res[, , j, drop = FALSE][, , 1]
-  tibble(
-    wave_agg = as.integer(colnames(mat)),
-    method   = paste0("method_", j),
-    gap_p50  = apply(mat, 2, median,   na.rm = TRUE),
-    gap_p05  = apply(mat, 2, quantile, probs = q_lo, na.rm = TRUE),
-    gap_p95  = apply(mat, 2, quantile, probs = q_hi, na.rm = TRUE)
-  )
-}
-
-gap_time_bands <- bind_rows(lapply(1:4, summ_one_method)) %>%
-  arrange(method, wave_agg)
-
-# (optional) save for plotting script
-path_out_fig3_bands <- "C:/Università/Tesi 3/Comparison Metrics/Figure3_ImputationBands_Methods1to4.csv"
-readr::write_csv(gap_time_bands, path_out_fig3_bands)
-cat("\nSaved Figure 3 imputation bands:", path_out_fig3_bands, "\n")
-
-
-# ==============================================================================
-# BLOCK 11 — Export Table metrics (CSV + LaTeX)
+# BLOCK 11 — Export Table 10 metrics (CSV + LaTeX)
 # ==============================================================================
 test_waves_label <- paste(test_waves, collapse = ", ")
 
@@ -991,6 +812,14 @@ metrics_tbl <- tribble(
   "Tail-risk", "Top-bin underprediction rate",        sprintf("%.8f", tail$topbin_under_rate),
   "Tail-risk", "Catastrophic flip rate (bottom↔top)", sprintf("%.8f", tail$catastrophic_rate),
   
+  "€-gap A", "Median AE (€)",   sprintf("%.1f",  metrics_gap_a$medae),
+  "€-gap A", "Bias mean (€)",   sprintf("%.1f",  metrics_gap_a$bias_mean),
+  "€-gap A", "Bias median (€)", sprintf("%.1f",  metrics_gap_a$bias_median),
+  
+  "€-gap B", "Median AE (€)",   sprintf("%.1f",  metrics_gap_b$medae),
+  "€-gap B", "Bias mean (€)",   sprintf("%.1f",  metrics_gap_b$bias_mean),
+  "€-gap B", "Bias median (€)", sprintf("%.1f",  metrics_gap_b$bias_median),
+  
   "€-gap (vulnerable==0)", "N used",               as.character(metrics_gap_a$n),
   "€-gap A", "RMSE (€)",      sprintf("%.1f",  metrics_gap_a$rmse),
   "€-gap A", "MAE (€)",       sprintf("%.1f",  metrics_gap_a$mae),
@@ -1021,7 +850,7 @@ tex_lines <- c(
 )
 writeLines(tex_lines, path_out_metrics_tex)
 
-cat("\nSaved Table metrics:\n - CSV:", path_out_metrics_csv,
+cat("\nSaved Table 10 metrics:\n - CSV:", path_out_metrics_csv,
     "\n - TEX:", path_out_metrics_tex, "\n")
 
 t1 <- Sys.time()
