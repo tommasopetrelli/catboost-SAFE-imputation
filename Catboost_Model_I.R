@@ -18,6 +18,14 @@
 #   10) Merge imputed midpoints back to general SAFE dataset
 #   11) Export Table 10 metrics (CSV + LaTeX)
 #   12) Heatmap: log(1+gap) error by country × sector/size
+#
+# Revision log (details: docs/Changes_vs_thesis.docx)
+#   C1  Class weights: switch CLASS_WEIGHT_MODE ("none" default / "corrected" /
+#       "legacy"); prior-shift correction of probabilities before evaluation and
+#       before the imputation draw.
+#   C2  Distributional credibility (TVD, mean shift) computed on expected shares
+#       = mean of predicted probabilities; argmax-based TVD (thesis) kept as legacy.
+#   C3  Sector/size grouping variables corrected (d3_rec / d1_rec).
 ################################################################################
 
 library(ggplot2)
@@ -47,6 +55,17 @@ path_out_metrics_tex <- ""
 path_out_heatmap <- ""
 
 n_cores <- max(1L, detectCores())
+
+# Class-weighting mode (change C1 — see docs/Changes_vs_thesis.docx)
+#   "none"      : no class weights. Predicted probabilities stay calibrated, so the
+#                 probabilistic draw in Block 9 reproduces the true bracket shares.
+#                 (default)
+#   "corrected" : class weights w_k = median(n)/n_k in training (as in the thesis),
+#                 then prior-shift correction p_k <- (p_k / w_k) / sum_j (p_j / w_j)
+#                 before any evaluation or draw.
+#   "legacy"    : thesis setting — class weights, no correction (reproduces thesis).
+CLASS_WEIGHT_MODE <- "none"
+stopifnot(CLASS_WEIGHT_MODE %in% c("none", "corrected", "legacy"))
 
 BIN_LEVELS <- c("1", "2", "5", "6", "4")
 
@@ -194,6 +213,97 @@ make_dist <- function(df, y_levels, group_vars = NULL) {
     )
   
   list(dist = dist, tvd = tvd_tbl)
+}
+
+# --- Change C1: class weights and prior-shift correction ------------------------
+# Returns the named weight map w_k = median(n)/n_k (names = class codes 0..K-1),
+# or NULL when CLASS_WEIGHT_MODE == "none".
+class_weight_map <- function(y_cls, mode = CLASS_WEIGHT_MODE) {
+  if (mode == "none") return(NULL)
+  freq  <- table(y_cls)
+  w_map <- median(as.numeric(freq)) / as.numeric(freq)
+  names(w_map) <- names(freq)
+  w_map
+}
+
+# Row weights for catboost.load_pool (NULL = unweighted)
+row_weights <- function(y_cls, w_map) {
+  if (is.null(w_map)) return(NULL)
+  w <- as.numeric(w_map[as.character(y_cls)])
+  w[is.na(w)] <- 1
+  w
+}
+
+# Undo the class weighting on predicted probabilities (only in "corrected" mode).
+# Weighting class k by w_k multiplies its odds by w_k; dividing by w_k and
+# renormalising restores probabilities on the original class frequencies.
+correct_probs <- function(probs, w_map, n_classes, mode = CLASS_WEIGHT_MODE) {
+  if (is.null(dim(probs))) probs <- matrix(probs, ncol = n_classes, byrow = TRUE)
+  if (mode != "corrected" || is.null(w_map)) return(probs)
+  w   <- as.numeric(w_map[as.character(0:(n_classes - 1L))])
+  w[is.na(w)] <- 1
+  adj <- sweep(probs, 2, w, "/")
+  adj / rowSums(adj)
+}
+
+# --- Change C2: TVD on expected shares (mean of predicted probabilities) -----
+# For each group g and bracket k:
+#   share_pred_gk = (1/n_g) * sum_{i in g} p_hat_ik      (expected share under the draw)
+#   share_true_gk = (1/n_g) * sum_{i in g} 1{k_i = k}
+#   TVD_g         = 0.5 * sum_k |share_pred_gk - share_true_gk|
+# This evaluates exactly the object produced by the probabilistic imputation
+# (Block 9) without Monte Carlo noise; the thesis computed TVD on argmax labels.
+make_dist_prob <- function(df, probs, y_levels, group_vars = NULL) {
+  K     <- length(y_levels)
+  pcols <- paste0("p_", seq_len(K))
+  colnames(probs) <- pcols
+
+  if (is.null(group_vars) || length(group_vars) == 0) {
+    df         <- df %>% mutate(grp = "ALL")
+    group_vars <- "grp"
+  }
+  d <- bind_cols(
+    df %>% select(all_of(group_vars), q8a_true_int),
+    as.data.frame(probs)
+  )
+
+  pred <- d %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(across(all_of(pcols), mean), .groups = "drop") %>%
+    tidyr::pivot_longer(all_of(pcols), names_to = "k", values_to = "share_pred") %>%
+    mutate(k = as.integer(sub("p_", "", k)))
+
+  true <- d %>%
+    count(across(all_of(group_vars)), k = q8a_true_int, name = "n_true")
+
+  dist <- tidyr::crossing(
+    d %>% distinct(across(all_of(group_vars))),
+    k = seq_len(K)
+  ) %>%
+    left_join(pred, by = c(group_vars, "k")) %>%
+    left_join(true, by = c(group_vars, "k")) %>%
+    mutate(n_true = tidyr::replace_na(n_true, 0L)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    mutate(
+      share_true = n_true / sum(n_true),
+      diff_share = share_pred - share_true
+    ) %>%
+    ungroup() %>%
+    mutate(bin = factor(y_levels[k], levels = y_levels, ordered = TRUE))
+
+  tvd_tbl <- dist %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      n             = sum(n_true),
+      tvd           = 0.5 * sum(abs(share_pred - share_true)),
+      mean_true_int = sum(k * share_true),
+      mean_pred_int = sum(k * share_pred),
+      mean_shift    = mean_pred_int - mean_true_int,
+      .groups = "drop"
+    )
+
+  list(dist = dist %>% select(-k) %>% relocate(bin, .after = all_of(group_vars)),
+       tvd  = tvd_tbl)
 }
 
 tail_risk_metrics <- function(true_int, pred_int, true_mid, pred_mid_snap) {
@@ -349,11 +459,9 @@ y_test_int  <- y_testable_int[test_idx]
 y_train_cls <- y_testable_cls[train_idx]
 y_test_cls  <- y_testable_cls[test_idx]
 
-freq_train        <- table(y_train_cls)
-w_map             <- median(as.numeric(freq_train)) / as.numeric(freq_train)
-names(w_map)      <- names(freq_train)
-w_train           <- as.numeric(w_map[as.character(y_train_cls)])
-w_train[is.na(w_train)] <- 1
+# Change C1: class weights only if CLASS_WEIGHT_MODE != "none"
+w_map   <- class_weight_map(y_train_cls)
+w_train <- row_weights(y_train_cls, w_map)
 
 train_pool <- catboost.load_pool(
   X_all[train_idx, ], y_train_cls,
@@ -394,6 +502,7 @@ for (i in seq_len(nrow(grid))) {
   
   m         <- catboost.train(train_pool, test_pool, params = params)
   probs_i   <- catboost.predict(m, test_pool, prediction_type = "Probability")
+  probs_i   <- correct_probs(probs_i, w_map, n_classes)   # change C1
   logloss_i <- safe_logloss(probs_i, y_test_cls, n_classes)
   
   best_iter_i <- tryCatch(catboost.get_best_iteration(m) + 1L,
@@ -417,11 +526,9 @@ cat(sprintf("Best holdout logloss: %.5f | Best iteration: %d\n", best$logloss, b
 # ==============================================================================
 # BLOCK 7 — Final model (fit on ALL observed q8a)
 # ==============================================================================
-freq_all         <- table(y_testable_cls)
-w_map_all        <- median(as.numeric(freq_all)) / as.numeric(freq_all)
-names(w_map_all) <- names(freq_all)
-w_all            <- as.numeric(w_map_all[as.character(y_testable_cls)])
-w_all[is.na(w_all)] <- 1
+# Change C1: class weights only if CLASS_WEIGHT_MODE != "none"
+w_map_all <- class_weight_map(y_testable_cls)
+w_all     <- row_weights(y_testable_cls, w_map_all)
 
 all_pool <- catboost.load_pool(
   X_all, y_testable_cls,
@@ -455,8 +562,10 @@ diag_params <- modifyList(final_params, list(
 diag_model <- catboost.train(train_pool, test_pool, params = diag_params)
 
 probs_test <- catboost.predict(diag_model, test_pool, prediction_type = "Probability")
-if (is.null(dim(probs_test))) probs_test <- matrix(probs_test, ncol = n_classes, byrow = TRUE)
+probs_test <- correct_probs(probs_test, w_map, n_classes)   # change C1 (no-op unless "corrected")
 
+# Argmax labels: used ONLY for individual-level accuracy metrics (accuracy, QWK, F1,
+# tail risk). Aggregate/distributional metrics use the probabilities (change C2).
 pred_cls <- max.col(probs_test) - 1L
 pred_int <- pred_cls + 1L
 
@@ -484,7 +593,13 @@ eval_df <- model_df[test_idx, ] %>%
     q8a_pred_bin = factor(pred_int,   levels = 1:n_classes, labels = y_levels, ordered = TRUE)
   )
 
-extra_grp   <- intersect(c("d1", "d2"), names(dataset_A_raw))
+# Change C3: grouping variables. In SAFE, D1 = size (employees) and D3 = sector
+# (thesis, Ch. 2). The thesis script grouped "sector" by d1 and "size" by d2,
+# so its "TVD by sector" was in fact TVD by size class. The recoded versions
+# (d1_rec, d3_rec — also used by the heatmap in Block 12) are preferred.
+SECTOR_VAR <- intersect(c("d3_rec", "d3"), names(dataset_A_raw))[1]
+SIZE_VAR   <- intersect(c("d1_rec", "d1"), names(dataset_A_raw))[1]
+extra_grp   <- na.omit(c(SECTOR_VAR, SIZE_VAR))
 missing_grp <- setdiff(extra_grp, names(eval_df))
 if (length(missing_grp) > 0) {
   eval_df <- eval_df %>%
@@ -492,51 +607,73 @@ if (length(missing_grp) > 0) {
               by = c("permid", "wave_agg"))
 }
 
-overall    <- make_dist(eval_df, y_levels)
-by_wave    <- make_dist(eval_df, y_levels, "wave_agg")
-by_country <- make_dist(eval_df, y_levels, "d0")
-by_sector  <- if ("d1" %in% names(eval_df)) make_dist(eval_df, y_levels, "d1") else NULL
-by_size    <- if ("d2" %in% names(eval_df)) make_dist(eval_df, y_levels, "d2") else NULL
-
-dist_list <- list(
-  overall$dist    %>% mutate(scope = "overall"),
-  by_wave$dist    %>% mutate(scope = "wave_agg"),
-  by_country$dist %>% mutate(scope = "d0")
+group_specs <- list(
+  overall  = NULL,
+  wave_agg = "wave_agg",
+  d0       = "d0",
+  sector   = if (!is.na(SECTOR_VAR)) SECTOR_VAR else NA,
+  size     = if (!is.na(SIZE_VAR))   SIZE_VAR   else NA
 )
-tvd_list <- list(
-  overall$tvd    %>% mutate(scope = "overall"),
-  by_wave$tvd    %>% mutate(scope = "wave_agg"),
-  by_country$tvd %>% mutate(scope = "d0")
+group_specs <- group_specs[!sapply(group_specs, function(g) length(g) == 1 && is.na(g))]
+
+# Change C2: primary = expected shares (mean of probabilities);
+#            legacy  = argmax labels (thesis definition), kept for comparison.
+run_dist <- function(fun_type) {
+  res <- lapply(group_specs, function(g) {
+    if (fun_type == "expected") make_dist_prob(eval_df, probs_test, y_levels, g)
+    else                        make_dist(eval_df, y_levels, g)
+  })
+  names(res) <- names(group_specs)
+  res
+}
+dist_expected <- run_dist("expected")
+dist_argmax   <- run_dist("argmax")
+
+stack_scope <- function(res, what, method) {
+  bind_rows(lapply(names(res), function(s) {
+    x <- res[[s]][[what]] %>% mutate(scope = s, tvd_method = method)
+    # harmonise group columns into one 'group' column for export
+    gcols <- intersect(names(x), c("grp", "wave_agg", "d0", SECTOR_VAR, SIZE_VAR))
+    x %>% mutate(group = if (length(gcols)) as.character(.data[[gcols[1]]]) else "ALL") %>%
+      select(-any_of(gcols))
+  })) %>% relocate(tvd_method, scope, group)
+}
+
+dist_all <- bind_rows(stack_scope(dist_expected, "dist", "expected_share"),
+                      stack_scope(dist_argmax,   "dist", "argmax"))
+tvd_all  <- bind_rows(stack_scope(dist_expected, "tvd",  "expected_share"),
+                      stack_scope(dist_argmax,   "tvd",  "argmax"))
+
+write_dta(dist_all %>% mutate(bin = as.character(bin)) %>%
+            select(-any_of(c("q8a_true_bin", "q8a_pred_bin"))), path_out_dist)
+write_dta(tvd_all, path_out_tvd)
+
+summ_tvd <- function(res) {
+  avg <- function(s, col) if (!is.null(res[[s]])) mean(res[[s]]$tvd[[col]], na.rm = TRUE) else NA_real_
+  list(
+    overall_tvd        = res$overall$tvd$tvd[1],
+    avg_tvd_wave       = avg("wave_agg", "tvd"),
+    avg_tvd_country    = avg("d0", "tvd"),
+    avg_tvd_sector     = avg("sector", "tvd"),
+    avg_tvd_size       = avg("size", "tvd"),
+    overall_shift      = res$overall$tvd$mean_shift[1],
+    avg_shift_wave     = avg("wave_agg", "mean_shift"),
+    avg_shift_country  = avg("d0", "mean_shift"),
+    avg_shift_sector   = avg("sector", "mean_shift"),
+    avg_shift_size     = avg("size", "mean_shift")
+  )
+}
+tvd_E <- summ_tvd(dist_expected)   # primary (change C2)
+tvd_A <- summ_tvd(dist_argmax)     # thesis definition
+
+# Expected vs observed bracket shares, overall (calibration-in-the-large check)
+cat("\n--- Overall bracket shares: observed vs expected (mean prob.) vs argmax ---\n")
+print(
+  dist_expected$overall$dist %>%
+    select(bin, share_true, share_pred_expected = share_pred) %>%
+    left_join(dist_argmax$overall$dist %>% select(bin, share_pred_argmax = share_pred),
+              by = "bin")
 )
-
-if (!is.null(by_sector)) {
-  dist_list <- c(dist_list, list(by_sector$dist %>% mutate(scope = "d1")))
-  tvd_list  <- c(tvd_list,  list(by_sector$tvd  %>% mutate(scope = "d1")))
-}
-if (!is.null(by_size)) {
-  dist_list <- c(dist_list, list(by_size$dist %>% mutate(scope = "d2")))
-  tvd_list  <- c(tvd_list,  list(by_size$tvd  %>% mutate(scope = "d2")))
-}
-
-dist_all <- bind_rows(dist_list) %>%
-  relocate(scope, any_of(c("grp", "wave_agg", "d0", "d1", "d2")))
-tvd_all  <- bind_rows(tvd_list)  %>%
-  relocate(scope, any_of(c("grp", "wave_agg", "d0", "d1", "d2")))
-
-write_dta(dist_all, path_out_dist)
-write_dta(tvd_all,  path_out_tvd)
-
-overall_tvd               <- overall$tvd$tvd[1]
-avg_tvd_by_wave           <- mean(by_wave$tvd$tvd,    na.rm = TRUE)
-avg_tvd_by_country        <- mean(by_country$tvd$tvd, na.rm = TRUE)
-avg_tvd_by_sector         <- if (!is.null(by_sector)) mean(by_sector$tvd$tvd, na.rm = TRUE) else NA_real_
-avg_tvd_by_size           <- if (!is.null(by_size))   mean(by_size$tvd$tvd,   na.rm = TRUE) else NA_real_
-
-overall_mean_shift        <- overall$tvd$mean_shift[1]
-avg_mean_shift_by_wave    <- mean(by_wave$tvd$mean_shift,    na.rm = TRUE)
-avg_mean_shift_by_country <- mean(by_country$tvd$mean_shift, na.rm = TRUE)
-avg_mean_shift_by_sector  <- if (!is.null(by_sector)) mean(by_sector$tvd$mean_shift, na.rm = TRUE) else NA_real_
-avg_mean_shift_by_size    <- if (!is.null(by_size))   mean(by_size$tvd$mean_shift,   na.rm = TRUE) else NA_real_
 
 # €-space metrics
 true_code     <- as.character(model_df$q8a[test_idx])
@@ -658,17 +795,25 @@ cat(sprintf("Within-1 accuracy           : %.4f\n", acc_within1))
 cat(sprintf("Quadratic weighted kappa    : %.4f\n", qwk))
 cat(sprintf("Macro F1                    : %.4f\n", macro_f1))
 
-cat("\n--- Distributional credibility (bracket shares) ---\n")
-cat(sprintf("Overall TVD (bins)          : %.4f\n", overall_tvd))
-cat(sprintf("Avg TVD by wave             : %.4f\n", avg_tvd_by_wave))
-cat(sprintf("Avg TVD by country          : %.4f\n", avg_tvd_by_country))
-cat(sprintf("Avg TVD by sector           : %.4f\n", avg_tvd_by_sector))
-cat(sprintf("Avg TVD by size             : %.4f\n", avg_tvd_by_size))
+cat(sprintf("\nClass-weight mode           : %s\n", CLASS_WEIGHT_MODE))
+cat("\n--- Distributional credibility: expected shares (mean prob.) [primary] ---\n")
+cat(sprintf("Overall TVD                 : %.4f\n", tvd_E$overall_tvd))
+cat(sprintf("Avg TVD by wave             : %.4f\n", tvd_E$avg_tvd_wave))
+cat(sprintf("Avg TVD by country          : %.4f\n", tvd_E$avg_tvd_country))
+cat(sprintf("Avg TVD by sector (%s)  : %.4f\n", SECTOR_VAR, tvd_E$avg_tvd_sector))
+cat(sprintf("Avg TVD by size (%s)    : %.4f\n", SIZE_VAR,   tvd_E$avg_tvd_size))
+cat(sprintf("Overall mean shift (bins)   : %.4f\n", tvd_E$overall_shift))
+cat(sprintf("Avg mean shift by country   : %.4f\n", tvd_E$avg_shift_country))
+cat(sprintf("Avg mean shift by sector    : %.4f\n", tvd_E$avg_shift_sector))
+cat(sprintf("Avg mean shift by size      : %.4f\n", tvd_E$avg_shift_size))
 
-cat(sprintf("Overall mean shift (bins)   : %.4f\n", overall_mean_shift))
-cat(sprintf("Avg mean shift by country   : %.4f\n", avg_mean_shift_by_country))
-cat(sprintf("Avg mean shift by sector    : %.4f\n", avg_mean_shift_by_sector))
-cat(sprintf("Avg mean shift by size      : %.4f\n", avg_mean_shift_by_size))
+cat("\n--- Distributional credibility: argmax labels [thesis definition] ---\n")
+cat(sprintf("Overall TVD                 : %.4f\n", tvd_A$overall_tvd))
+cat(sprintf("Avg TVD by wave             : %.4f\n", tvd_A$avg_tvd_wave))
+cat(sprintf("Avg TVD by country          : %.4f\n", tvd_A$avg_tvd_country))
+cat(sprintf("Avg TVD by sector           : %.4f\n", tvd_A$avg_tvd_sector))
+cat(sprintf("Avg TVD by size             : %.4f\n", tvd_A$avg_tvd_size))
+cat(sprintf("Overall mean shift (bins)   : %.4f\n", tvd_A$overall_shift))
 
 cat("\n--- Tail-risk diagnostics ---\n")
 cat(sprintf("Big mistake rate (|Δbin|≥2) : %.6f\n", tail$big_mistake_rate))
@@ -729,6 +874,8 @@ if (length(miss_idx) > 0) {
   
   probs_miss <- catboost.predict(final_model, miss_pool, prediction_type = "Probability")
   if (is.null(dim(probs_miss))) probs_miss <- matrix(probs_miss, ncol = n_classes, byrow = TRUE)
+  # Change C1: the draw must use probabilities on the original class frequencies
+  probs_miss <- correct_probs(probs_miss, w_map_all, n_classes)
   
   set.seed(123)
   q8a_imputed_chr[miss_idx] <- apply(probs_miss, 1, function(p) sample(y_levels, 1L, prob = p))
@@ -780,16 +927,25 @@ metrics_tbl <- tribble(
   "Bin-space", "Quadratic weighted kappa", sprintf("%.4f", qwk),
   "Bin-space", "Macro F1",                 sprintf("%.4f", macro_f1),
   
-  "Distribution (TVD)", "Overall TVD",         sprintf("%.4f", overall_tvd),
-  "Distribution (TVD)", "Avg. TVD by wave",    sprintf("%.4f", avg_tvd_by_wave),
-  "Distribution (TVD)", "Avg. TVD by country", sprintf("%.4f", avg_tvd_by_country),
-  "Distribution (TVD)", "Avg. TVD by sector",  sprintf("%.4f", avg_tvd_by_sector),
-  "Distribution (TVD)", "Avg. TVD by size",    sprintf("%.4f", avg_tvd_by_size),
+  "Setup", "Class-weight mode",      CLASS_WEIGHT_MODE,
   
-  "Distribution (Mean shift)", "Overall mean shift",         sprintf("%.4f", overall_mean_shift),
-  "Distribution (Mean shift)", "Avg. mean shift by country", sprintf("%.4f", avg_mean_shift_by_country),
-  "Distribution (Mean shift)", "Avg. mean shift by sector",  sprintf("%.4f", avg_mean_shift_by_sector),
-  "Distribution (Mean shift)", "Avg. mean shift by size",    sprintf("%.4f", avg_mean_shift_by_size),
+  "Distribution (TVD, expected shares)", "Overall TVD",         sprintf("%.4f", tvd_E$overall_tvd),
+  "Distribution (TVD, expected shares)", "Avg. TVD by wave",    sprintf("%.4f", tvd_E$avg_tvd_wave),
+  "Distribution (TVD, expected shares)", "Avg. TVD by country", sprintf("%.4f", tvd_E$avg_tvd_country),
+  "Distribution (TVD, expected shares)", "Avg. TVD by sector",  sprintf("%.4f", tvd_E$avg_tvd_sector),
+  "Distribution (TVD, expected shares)", "Avg. TVD by size",    sprintf("%.4f", tvd_E$avg_tvd_size),
+  
+  "Distribution (Mean shift, expected shares)", "Overall mean shift",         sprintf("%.4f", tvd_E$overall_shift),
+  "Distribution (Mean shift, expected shares)", "Avg. mean shift by country", sprintf("%.4f", tvd_E$avg_shift_country),
+  "Distribution (Mean shift, expected shares)", "Avg. mean shift by sector",  sprintf("%.4f", tvd_E$avg_shift_sector),
+  "Distribution (Mean shift, expected shares)", "Avg. mean shift by size",    sprintf("%.4f", tvd_E$avg_shift_size),
+  
+  "Distribution (TVD, argmax - thesis def.)", "Overall TVD",         sprintf("%.4f", tvd_A$overall_tvd),
+  "Distribution (TVD, argmax - thesis def.)", "Avg. TVD by wave",    sprintf("%.4f", tvd_A$avg_tvd_wave),
+  "Distribution (TVD, argmax - thesis def.)", "Avg. TVD by country", sprintf("%.4f", tvd_A$avg_tvd_country),
+  "Distribution (TVD, argmax - thesis def.)", "Avg. TVD by sector",  sprintf("%.4f", tvd_A$avg_tvd_sector),
+  "Distribution (TVD, argmax - thesis def.)", "Avg. TVD by size",    sprintf("%.4f", tvd_A$avg_tvd_size),
+  "Distribution (TVD, argmax - thesis def.)", "Overall mean shift",  sprintf("%.4f", tvd_A$overall_shift),
   
   "€-space", "RMSE (€)",      sprintf("%.1f",  metrics_eur$rmse_eur),
   "€-space", "MAE (€)",       sprintf("%.1f",  metrics_eur$mae_eur),
