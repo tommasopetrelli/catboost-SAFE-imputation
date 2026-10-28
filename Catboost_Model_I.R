@@ -26,6 +26,10 @@
 #   C2  Distributional credibility (TVD, mean shift) computed on expected shares
 #       = mean of predicted probabilities; argmax-based TVD (thesis) kept as legacy.
 #   C3  Sector/size grouping variables corrected (d3_rec / d1_rec).
+#   C4  Tail-risk diagnostics in expected (probability) form, consistent with the
+#       imputation draw: expected top-bracket share, expected top-bin
+#       underprediction, expected big-mistake and flip rates, top-bracket
+#       discrimination (AUC); argmax versions kept.
 ################################################################################
 
 library(ggplot2)
@@ -322,6 +326,45 @@ tail_risk_metrics <- function(true_int, pred_int, true_mid, pred_mid_snap) {
       (true_int == Kmin & pred_int == Kmax) | (true_int == Kmax & pred_int == Kmin),
       na.rm = TRUE
     )
+  )
+}
+
+# --- Change C4: tail-risk diagnostics in expected (probability) form ------------
+# Each argmax-based tail metric is replaced by its expectation under the
+# probabilistic draw used in Block 9 (Y_i* ~ Categorical(p_i)):
+#   E[big mistake]  = mean_i sum_{k: |k - k_i| >= 2} p_ik
+#   E[TBU]          = mean_{i: k_i = K} (1 - p_iK)
+#   E[flip]         = mean_i [ 1{k_i = 1} p_iK + 1{k_i = K} p_i1 ]
+#   top share       = mean_i p_iK  vs  mean_i 1{k_i = K}
+#   P(top | top)    = mean_{i: k_i = K} p_iK ;  P(top | not top) = mean_{i: k_i < K} p_iK
+#   AUC(top)        = Pr(p_iK > p_jK | k_i = K, k_j < K)  (Mann-Whitney, ties = 1/2)
+# AUC measures how well the model ranks top-bracket firms above the others,
+# independently of calibration: it is the metric that captures the
+# "learn the tails" motivation for class weights (thesis section 3.2.2).
+auc_binary <- function(score, is_pos) {
+  ok <- is.finite(score) & !is.na(is_pos)
+  score <- score[ok]; is_pos <- is_pos[ok]
+  n1 <- sum(is_pos); n0 <- sum(!is_pos)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  rk <- rank(score)                       # average ranks handle ties
+  (sum(rk[is_pos]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+tail_risk_expected <- function(true_int, probs) {
+  K   <- ncol(probs)
+  n   <- length(true_int)
+  dist_mat <- abs(outer(true_int, seq_len(K), "-"))       # |k - k_i|
+  top  <- true_int == K
+  list(
+    exp_big_mistake_rate  = mean(rowSums(probs * (dist_mat >= 2))),
+    exp_topbin_under_rate = if (any(top)) mean(1 - probs[top, K]) else NA_real_,
+    exp_catastrophic_rate = mean((true_int == 1) * probs[, K] + top * probs[, 1]),
+    top_share_true        = mean(top),
+    top_share_expected    = mean(probs[, K]),
+    top_share_ratio       = mean(probs[, K]) / mean(top),
+    p_top_given_top       = if (any(top))  mean(probs[top, K])  else NA_real_,
+    p_top_given_nontop    = if (any(!top)) mean(probs[!top, K]) else NA_real_,
+    auc_top               = auc_binary(probs[, K], top)
   )
 }
 
@@ -710,6 +753,7 @@ metrics_log <- list(
 )
 
 tail <- tail_risk_metrics(y_test_int, pred_int, true_mid, pred_mid_snap)
+tail_E <- tail_risk_expected(y_test_int, probs_test)   # change C4
 
 # Euro financing gap metrics
 gap_base <- model_df[test_idx, c("permid", "wave_agg")] %>%
@@ -815,7 +859,18 @@ cat(sprintf("Avg TVD by sector           : %.4f\n", tvd_A$avg_tvd_sector))
 cat(sprintf("Avg TVD by size             : %.4f\n", tvd_A$avg_tvd_size))
 cat(sprintf("Overall mean shift (bins)   : %.4f\n", tvd_A$overall_shift))
 
-cat("\n--- Tail-risk diagnostics ---\n")
+cat("\n--- Tail-risk diagnostics: expected under the draw [primary, change C4] ---\n")
+cat(sprintf("E[big mistake rate]         : %.6f\n", tail_E$exp_big_mistake_rate))
+cat(sprintf("E[top-bin underprediction]  : %.6f\n", tail_E$exp_topbin_under_rate))
+cat(sprintf("E[catastrophic flip rate]   : %.6f\n", tail_E$exp_catastrophic_rate))
+cat(sprintf("Top-bracket share true      : %.4f\n", tail_E$top_share_true))
+cat(sprintf("Top-bracket share expected  : %.4f  (ratio %.3f)\n",
+            tail_E$top_share_expected, tail_E$top_share_ratio))
+cat(sprintf("P(top | true top)           : %.4f\n", tail_E$p_top_given_top))
+cat(sprintf("P(top | true not top)       : %.4f\n", tail_E$p_top_given_nontop))
+cat(sprintf("AUC top vs rest             : %.4f\n", tail_E$auc_top))
+
+cat("\n--- Tail-risk diagnostics: argmax labels [thesis definition] ---\n")
 cat(sprintf("Big mistake rate (|Δbin|≥2) : %.6f\n", tail$big_mistake_rate))
 cat(sprintf("Top-bin underprediction rate: %.6f\n", tail$topbin_under_rate))
 cat(sprintf("Catastrophic flip rate      : %.6f\n", tail$catastrophic_rate))
@@ -963,10 +1018,20 @@ metrics_tbl <- tribble(
   "log1p(€)", "Bias mean",   sprintf("%.4f", metrics_log$bias_mean_log1p),
   "log1p(€)", "Bias median", sprintf("%.4f", metrics_log$bias_median_log1p),
   
-  "Tail-risk", "Big mistake rate (|Δbin|≥2)",        sprintf("%.8f", tail$big_mistake_rate),
-  "Tail-risk", "AE p95 (€)",                         sprintf("%.1f",  tail$ae_p95_eur),
-  "Tail-risk", "Top-bin underprediction rate",        sprintf("%.8f", tail$topbin_under_rate),
-  "Tail-risk", "Catastrophic flip rate (bottom↔top)", sprintf("%.8f", tail$catastrophic_rate),
+  "Tail-risk (expected)", "E[big mistake rate]",            sprintf("%.6f", tail_E$exp_big_mistake_rate),
+  "Tail-risk (expected)", "E[top-bin underprediction]",     sprintf("%.6f", tail_E$exp_topbin_under_rate),
+  "Tail-risk (expected)", "E[catastrophic flip rate]",      sprintf("%.6f", tail_E$exp_catastrophic_rate),
+  "Tail-risk (expected)", "Top-bracket share true",         sprintf("%.4f", tail_E$top_share_true),
+  "Tail-risk (expected)", "Top-bracket share expected",     sprintf("%.4f", tail_E$top_share_expected),
+  "Tail-risk (expected)", "Top-bracket share ratio",        sprintf("%.4f", tail_E$top_share_ratio),
+  "Tail-risk (expected)", "P(top | true top)",              sprintf("%.4f", tail_E$p_top_given_top),
+  "Tail-risk (expected)", "P(top | true not top)",          sprintf("%.4f", tail_E$p_top_given_nontop),
+  "Tail-risk (expected)", "AUC top vs rest",                sprintf("%.4f", tail_E$auc_top),
+  
+  "Tail-risk (argmax - thesis def.)", "Big mistake rate (|Δbin|≥2)",        sprintf("%.8f", tail$big_mistake_rate),
+  "Tail-risk (argmax - thesis def.)", "AE p95 (€)",                         sprintf("%.1f",  tail$ae_p95_eur),
+  "Tail-risk (argmax - thesis def.)", "Top-bin underprediction rate",        sprintf("%.8f", tail$topbin_under_rate),
+  "Tail-risk (argmax - thesis def.)", "Catastrophic flip rate (bottom↔top)", sprintf("%.8f", tail$catastrophic_rate),
   
   "€-gap A", "Median AE (€)",   sprintf("%.1f",  metrics_gap_a$medae),
   "€-gap A", "Bias mean (€)",   sprintf("%.1f",  metrics_gap_a$bias_mean),
