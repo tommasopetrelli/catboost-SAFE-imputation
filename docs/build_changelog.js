@@ -36,7 +36,7 @@ const children = [
   new Paragraph({ children: [r('CatBoost imputation of SAFE Q8A', { size: 36, bold: true })], spacing: { after: 60 } }),
   new Paragraph({ children: [r('Changes to the pipeline relative to the MSc thesis', { size: 28 })], spacing: { after: 60 } }),
   new Paragraph({ children: [r('Reference: T. Petrelli (2026), “Measuring Financing Gaps with Machine Learning — Survey Evidence from SAFE in the European Union”, Bocconi MSc thesis. Repository: tommasopetrelli/catboost-SAFE-imputation.', { size: 19, color: '555555' })], spacing: { after: 60 } }),
-  new Paragraph({ children: [r('Change log version 1 — 25 October 2026', { size: 19, color: '555555' })], border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '2E5C8A', space: 6 } }, spacing: { after: 200 } }),
+  new Paragraph({ children: [r('Change log version 2 — 28 October 2026', { size: 19, color: '555555' })], border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '2E5C8A', space: 6 } }, spacing: { after: 200 } }),
 
   h1('1. Purpose of this document'),
   p('This document records every modification made to the imputation code after the thesis was submitted, and explains for each one what the thesis did, why it was changed, what the code now does, and how the thesis results are affected. It is updated each time the pipeline is modified, so that the paper’s methodology section and any reply to referees can be traced back to specific code changes.'),
@@ -48,9 +48,10 @@ const children = [
     ['C1', 'Class weights: optional, and corrected before evaluation and imputation draws', '§3.2.2, §4.1', 'Model I — Blocks 0, 1, 5, 6, 7, 8, 9', 'Changes imputed values and all holdout metrics'],
     ['C2', 'TVD and mean shift computed on expected shares (mean of predicted probabilities) instead of argmax labels', '§4.2.1, §4.3.1, Table 9, §4.5', 'Model I — Blocks 1, 8, 11', 'Changes Table 9 distributional rows; argmax version still reported'],
     ['C3', 'Correct grouping variables for “by sector” and “by size” diagnostics', 'Table 9', 'Model I — Block 8', 'Relabels / recomputes two rows of Table 9'],
+    ['C4', 'Tail-risk diagnostics in expected (probability) form, plus top-bracket share and discrimination (AUC); guardrail of the selection rule redefined accordingly', '§4.3.1, Table 9, §4.5', 'Model I — Blocks 1, 8, 11', 'Adds rows to Table 9; changes the TBU guardrail of the selection rule'],
   ]),
   gap(),
-  p([r('Status: ', { bold: true }), r('code changes implemented and tested on synthetic data (formulas checked by hand). The pipeline has not yet been re-run on the SAFE microdata, so the new numbers for Tables 9–11 are pending. Model II is unchanged.')]),
+  p([r('Status: ', { bold: true }), r('code changes implemented and tested on synthetic data (formulas checked by hand; C4 metrics checked against Monte Carlo draws). The pipeline has not yet been re-run on the SAFE microdata, so the new numbers for Tables 9–11 are pending. Model II is unchanged.')]),
 
   h1('3. Change C1 — Class weights'),
   h3('What the thesis did'),
@@ -67,7 +68,11 @@ const children = [
   b([r('"legacy": ', { bold: true }), r('thesis setting (weights, no correction). Used only to reproduce the thesis numbers.')]),
   p('The correction is applied consistently in the grid search (Block 6, so log-loss is computed on corrected probabilities), in the holdout evaluation (Block 8) and in the imputation (Block 9). New helper functions in Block 1: class_weight_map(), row_weights(), correct_probs().'),
   h3('Effect on results'),
-  p('Under "none" or "corrected", the imputed brackets, the euro-space metrics (which use the probability-weighted expected midpoint) and the financing-gap aggregates all change. The expected direction is fewer top-bracket imputations and therefore lower euro gaps, especially in the fully imputed waves after 2022. Individual-level metrics computed on argmax labels (accuracy, QWK, macro F1, tail-risk rates) may get worse under "none", because without weights the argmax rarely selects small brackets; this is expected and is not a problem for the estimand (see C2).'),
+  p('Under "none" or "corrected", the imputed brackets, the euro-space metrics (which use the probability-weighted expected midpoint) and the financing-gap aggregates all change. The expected direction is fewer top-bracket imputations and therefore lower euro gaps, especially in the fully imputed waves after 2022. Individual-level metrics computed on argmax labels (accuracy, QWK, macro F1, tail-risk rates) may get worse under "none", because without weights the argmax rarely selects small brackets; this is expected and is not a problem for the estimand (see C2 and C4).'),
+  h3('Does this still meet the purpose the thesis gave to the weights?'),
+  p('The thesis motivated the weights with two aims (§3.2.2): (i) avoid over-allocating firms to the modal bracket, so that the tails do not disappear from the imputed data; (ii) improve performance in the tails, above all the top bracket, which carries most of the euro value.'),
+  b([r('Aim (i) is met without weights. ', { bold: true }), r('Over-allocation to the modal bracket is a property of argmax assignment. The thesis already imputes by a random draw, precisely because the draw “preserves cross-sectional dispersion” (§3.2.2). With calibrated probabilities the draw reproduces each bracket share, tails included. Weights and draw were two remedies for the same problem; used together they over-corrected it.')]),
+  b([r('Aim (ii) is where the two settings differ. ', { bold: true }), r('Weights also change what the trees learn: top-bracket observations count more, so the model may become better at recognising which firms are in the top bracket. "none" gives up this emphasis; "corrected" keeps it in training and then restores calibrated probabilities. Because the prior-shift correction is exact only for a well-specified model, which setting is better is an empirical question, settled on the holdout with the metrics of C4.')]),
 
   h1('4. Change C2 — TVD on expected shares'),
   h3('What the thesis did'),
@@ -109,14 +114,38 @@ const children = [
   h3('Effect on results'),
   p('The thesis value 0.1240 labelled “by sector” is actually a by-size TVD (argmax definition). Both rows must be recomputed.'),
 
-  h1('6. What has not changed'),
-  b('Sample construction, Q8A cleaning, predictor screening and feature set (Blocks 2–4). Open issues on these are listed in section 7.'),
+  h1('6. Change C4 — Tail-risk diagnostics consistent with the draw'),
+  h3('What the thesis did'),
+  p('The tail-risk block of Table 9 (big-mistake rate, top-bin underprediction rate TBU, catastrophic flip rate) was computed on argmax labels. TBU also enters the model selection rule of §4.5 as a guardrail (TBU_m ≤ TBU* + δ_T).'),
+  h3('Why this is a problem'),
+  p('As with TVD (C2), argmax metrics do not describe the imputed data, which is produced by a random draw. TBU is the clearest case: without class weights the argmax almost never picks the top bracket (its probability is rarely the largest), so argmax-TBU approaches 1 even when the model reproduces the top-bracket share exactly. Keeping the argmax TBU as a guardrail would mechanically reject the calibrated model, for a reason that does not affect the dataset.'),
+  h3('What the code does now'),
+  p('Each tail metric is replaced by its expectation under the draw Y_i* ~ Categorical(p̂_i), where k_i is firm i’s observed bracket and K the top bracket:'),
+  table([3000, 6026], [
+    ['Metric', 'Definition'],
+    ['E[big mistake rate]', 'mean_i Σ_{k: |k − k_i| ≥ 2} p̂_ik — expected share of firms imputed two or more brackets away'],
+    ['E[top-bin underprediction]', 'mean over true-top firms of (1 − p̂_iK) — expected share of top-bracket firms imputed below the top'],
+    ['E[catastrophic flip rate]', 'mean_i [ 1{k_i = 1} p̂_iK + 1{k_i = K} p̂_i1 ]'],
+    ['Top-bracket share (true / expected / ratio)', 'mean_i 1{k_i = K} vs mean_i p̂_iK. Ratio > 1: the draw over-allocates to the EUR 1.5m bracket (euro gap biased up); < 1: under-allocates.'],
+    ['P(top | true top), P(top | true not top)', 'Average top-bracket probability for firms that are / are not in the top bracket. Their gap measures how well the model separates the two groups.'],
+    ['AUC top vs rest', 'Probability that a random top-bracket firm gets a higher p̂_iK than a random other firm (Mann–Whitney, ties = ½). 0.5 = no discrimination, 1 = perfect. Insensitive to calibration, so it isolates aim (ii) of the class weights.'],
+  ]),
+  gap(),
+  p('The expected metrics are deterministic (no seed dependence) and equal the average of the corresponding metrics computed on the drawn brackets, averaged over infinitely many draws; this was verified numerically against 400 Monte Carlo draws. The argmax versions remain in the output, labelled “thesis definition”. New functions tail_risk_expected() and auc_binary() in Block 1.'),
+  h3('How to read them when comparing "none" and "corrected"'),
+  b('Aggregate credibility (aim i): expected-share TVD (C2) and the top-bracket share ratio, which should be close to 1.'),
+  b('Tail discrimination (aim ii): AUC top vs rest, and the gap between P(top | true top) and P(top | true not top). If "corrected" gives a clearly higher AUC with a comparable share ratio and TVD, the weights are earning their place; otherwise "none" is preferred as the simpler choice.'),
+  h3('Proposed update to the selection rule (thesis §4.5)'),
+  p('In the admissible set F of equation (8), the guardrail TBU_m ≤ TBU* + δ_T is evaluated with the expected TBU instead of the argmax TBU. The objective (9) uses the expected-share TVD (C2). The other guardrails (RMSE, MAE on the expected midpoint; QWK and within-1 accuracy on argmax) are unchanged. A natural addition is a guardrail on the top-bracket share ratio, e.g. |ratio − 1| ≤ 0.10, since the top bracket dominates euro aggregates. The selection rule is applied by hand from the exported table; it is not coded in the script.'),
+
+  h1('7. What has not changed'),
+  b('Sample construction, Q8A cleaning, predictor screening and feature set (Blocks 2–4). Open issues on these are listed in section 8.'),
   b('Holdout design: last 20% of observed waves (waves 26–28).'),
   b('Hyper-parameter grid, early stopping, final refit on all observed Q8A.'),
   b('Bracket midpoints, including EUR 1.5 million for the open top bracket.'),
   b('Model II (Catboost_Model_II.R), RF_Old_Method.R and Post_Imputation_Comparison.'),
 
-  h1('7. Open issues identified (not yet implemented)'),
+  h1('8. Open issues identified (not yet implemented)'),
   p('Listed here so that future changes can refer back to them. Each will receive a change ID when implemented.'),
   table([700, 4200, 4126], [
     ['Ref.', 'Issue', 'Planned direction'],
@@ -128,10 +157,11 @@ const children = [
     ['G', 'Uncertainty bands hold the model fixed (no parameter uncertainty); the script producing them is not in the repository.', 'Bootstrap refits and Rubin’s rules; add the script to the repository.'],
   ]),
 
-  h1('8. Version history'),
+  h1('9. Version history'),
   table([1300, 1700, 6026], [
     ['Version', 'Date', 'Content'],
     ['1', '25 Oct 2026', 'C1 class weights, C2 expected-share TVD, C3 sector/size grouping variables (Catboost_Model_I.R).'],
+    ['2', '28 Oct 2026', 'C4 tail-risk diagnostics in expected form, top-bracket share and AUC; discussion of whether C1 meets the thesis purpose of the weights; proposed update to the §4.5 selection rule.'],
   ]),
 ];
 
